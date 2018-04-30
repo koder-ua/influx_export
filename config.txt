@@ -1,0 +1,18 @@
+from=2017-01-01T00:00:10
+to=2017-01-01T01:24:00
+step=2s
+maxpts=512
+cpu region='us-west'
+
+#libvirt_domain_block_stats_read_bytes_total AND target_device =~ /vd[a-z]+$/
+#libvirt_domain_block_stats_write_bytes_total AND target_device =~ /vd[a-z]+$/
+#diskio_read_bytes AND host =~ /ceph\d+$/ AND "name" =~ /sd[b-z]+$/
+#diskio_write_bytes AND host =~ /ceph\d+$/ AND "name" =~ /sd[b-z]+$/
+#net_bytes_sent AND host =~ /cmp\d+$/ AND interface =~ /en[os]\d+$/
+#net_bytes_sent AND host =~ /ceph\d+$/ AND interface =~ /en[os]\d+$/
+#net_bytes_recv AND host =~ /cmp\d+$/ AND interface =~ /en[os]\d+$/
+#net_bytes_recv AND host =~ /ceph\d+$/ AND interface =~ /en[os]\d+$/
+#cpu_usage_iowait AND host =~ /ceph\d+$/ AND cpu='cpu-total'
+#cpu_usage_guest AND host =~ /cmp\d+$/ AND cpu='cpu-total'
+#cpu_usage_user AND host =~ /cmp\d+$/ AND cpu='cpu-total'
+#cpu_usage_system AND host =~ /cmp\d+$/ AND cpu='cpu-total'
