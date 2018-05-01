@@ -38,11 +38,12 @@ type config struct {
 	maxResultPoints int
 	outputFname string
 	maxPerSecond int
+	checkUnpack bool
 }
 
 
 func makeConfig() *config {
-	return &config{params: make(map[string]string)}
+	return &config{params: make(map[string]string), checkUnpack: false}
 }
 
 var clog = logrus.New()
@@ -434,6 +435,17 @@ func unpackSerie(buff *bytes.Buffer) (*SerieData, error) {
 }
 
 
+func mapValues(mp *map[string]bool) []string {
+	res := make([]string, len(*mp))
+	idx := 0
+	for val := range *mp {
+		res[idx] = val
+		idx++
+	}
+	return res
+}
+
+
 func parseCLI(version string, cfg *config) {
 	app := kingpin.New(os.Args[0], "Influxdb data exporter")
 	app.Flag("url", "Server url").Short('U').PlaceHolder("PROTO://IP:PORT").
@@ -446,10 +458,42 @@ func parseCLI(version string, cfg *config) {
 		StringVar(&cfg.outputFname)
 	app.Flag("loglevel", "Log level (default = DEBUG)").Short('l').Default("DEBUG").
 		EnumVar(&cfg.logLevel, "DEBUG", "INFO", "WARNING", "ERROR", "FATAL")
+	app.Flag("check", "Check unpack of data").BoolVar(&cfg.checkUnpack)
 	app.Arg("config", "Config file.").Required().StringVar(&cfg.configName)
 	app.Version(version)
 	app.Parse(os.Args[1:])
 }
+
+
+func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
+	if s1.serie != s2.serie || len(s1.values) != len(s2.values) {
+		return false
+	} else {
+		for idx := range s1.values {
+			if s1.values[idx] != s2.values[idx] || s1.times[idx] != s2.times[idx] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+
+func testUnpack(origin *SerieData, rbuff *bytes.Buffer) {
+	v, e := unpackSerie(rbuff)
+	if e != nil {
+		clog.Fatal("Failed to unpack ", e.Error())
+	}
+
+	if rbuff.Len() != 0 {
+		clog.Fatal("Extra bytes left after unpacking")
+	}
+
+	if !checkSeriesEQ(v, origin) {
+		clog.Fatal("Unpacking failed")
+	}
+}
+
 
 func main() {
 	cfg := makeConfig()
@@ -484,13 +528,7 @@ func main() {
 		outFD = nil
 	}
 
-	selectors := make([]string, len(*series))
-	idx := 0
-	for selector := range *series {
-		selectors[idx] = selector
-		idx++
-	}
-
+	selectors := mapValues(series)
 	sort.Strings(selectors)
 
 	for _, selector := range selectors {
@@ -501,21 +539,10 @@ func main() {
 		data.serie = selector
 
 		wbuff := packSerie(data)
-		rbuff := bytes.NewBuffer(wbuff)
-		clog.Info(len(data.times), " points selected for ", data.serie, ". Packed into ", rbuff.Len(), " bytes")
+		clog.Info(len(data.times), " points selected for ", data.serie, ". Packed into ", len(wbuff), " bytes")
 
-		v, e := unpackSerie(rbuff)
-		if e != nil {
-			clog.Fatal("Failed to unpack ", e.Error())
-		}
-		if rbuff.Len() != 0 || v.serie != data.serie || len(v.values) != len(data.values) {
-			clog.Fatal("Incorrect unpacking")
-		} else {
-			for idx := range v.values {
-				if v.values[idx] != data.values[idx] || v.times[idx] != data.times[idx] {
-					clog.Fatal("Incorrect unpacking")
-				}
-			}
+		if cfg.checkUnpack {
+			testUnpack(data, bytes.NewBuffer(wbuff))
 		}
 
 		if outFD != nil {
