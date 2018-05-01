@@ -17,6 +17,8 @@ import (
 	"math"
 	"bytes"
 	"errors"
+	"fmt"
+	"sort"
 )
 
 const IdentPattern = "[a-zA-Z_][a-zA-Z_0-9]+"
@@ -35,6 +37,7 @@ type config struct {
 	timePoints [] string
 	maxResultPoints int
 	outputFname string
+	maxPerSecond int
 }
 
 
@@ -171,7 +174,75 @@ type SerieData struct {
 }
 
 
-func mirrorSerie(cfg *config, query string, conn client.Client) *SerieData {
+func runSQLToData(sql string, database string, conn client.Client, data *SerieData,
+				  startTm int64) (error, int, int64, int64) {
+
+	q := client.NewQuery(sql, database, "s")
+
+	qStartAt := time.Now().UnixNano()
+	if response, err := conn.Query(q); err == nil && response.Error() == nil {
+		qRunTime := time.Now().UnixNano() - qStartAt
+		if len(response.Results) > 1 {
+			return errors.New("incorrect responce (2+ results)"), 0, 0, 0
+		}
+
+		prevPoints := 0
+		if len(response.Results) == 1 {
+			result := response.Results[0]
+
+			if len(result.Series) > 1 {
+				return errors.New("incorrect responce (2+ series)"), 0, 0, 0
+			}
+
+			if len(result.Series) == 1 {
+				serie := result.Series[0]
+
+				if len(serie.Columns) != 2 || serie.Columns[0] != "time" || serie.Columns[1] != "sum" {
+					return errors.New("incorrect columns '" + fmt.Sprintf("%v", serie.Columns)), 0, 0, 0
+				}
+
+				prevPoints = len(serie.Values)
+
+				for _, row := range serie.Values {
+					if len(row) != 2 {
+						return errors.New(strconv.Itoa(len(row)) + " (must be 2) fields in row"), 0, 0, 0
+					}
+
+					if row[1] == nil {
+						// no data for this time point
+						continue
+					}
+
+					timeVl, err1 := row[0].(json.Number).Int64()
+					if err1 != nil {
+						return errors.New("can't parse time from influx output as int64 " + err1.Error()), 0, 0, 0
+					}
+					timeVls := timeVl/1000000000 - startTm
+					if timeVls > math.MaxUint32 {
+						return errors.New("time if to far in future - can't be represented as uint32"), 0, 0, 0
+					}
+					data.times = append(data.times, uint32(timeVls))
+
+					dataVl, err2 := row[1].(json.Number).Float64()
+					if err2 != nil {
+						return errors.New("can't parse data from influx output as float64 " + err2.Error()), 0, 0, 0
+					}
+					data.values = append(data.values, uint64(dataVl*1000))
+				}
+			}
+		}
+		return nil, prevPoints, qStartAt, qRunTime
+	} else {
+		cerr := err
+		if cerr == nil {
+			cerr = response.Error()
+		}
+		return cerr, 0, 0, 0
+	}
+}
+
+func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieData) {
+	clog.Info("Selecting '", query, "' serie")
 	data := SerieData{
 		times: make([]uint32, 0, cfg.maxResultPoints),
 		values: make([]uint64, 0, cfg.maxResultPoints),
@@ -182,59 +253,30 @@ func mirrorSerie(cfg *config, query string, conn client.Client) *SerieData {
 	for idx := 0 ; idx < len(cfg.timePoints) - 1 ; idx++ {
 		frm := cfg.timePoints[idx]
 		to := cfg.timePoints[idx + 1]
-		sql := "SELECT sum(value) FROM " + query + " AND time>='" + frm + "' AND time<'" + to +
-			"' GROUP BY time(" + cfg.step + ")"
-		q := client.NewQuery(sql, cfg.database, "s")
-		if response, err := conn.Query(q); err == nil && response.Error() == nil {
-			if len(response.Results) != 1 {
-				clog.Fatal("Incorrect responce for '" + sql + "'")
+		sql := fmt.Sprintf("SELECT sum(value) FROM %s AND time>='%s' AND time<'%s' GROUP BY time(%s)",
+							query, frm, to, cfg.step)
+
+		err, numSelected, qStartAt, qRunTime := runSQLToData(sql, cfg.database, conn, &data, janFirst2017UTC)
+
+		if err != nil {
+			return errors.New("during '" + sql + "' :" + err.Error()), nil
+		}
+
+		switch {
+		case cfg.maxPerSecond == 0:
+			// no throttle
+		case cfg.maxPerSecond == -1:
+			// sleep as long as previous sql executed
+			time.Sleep(time.Duration(int64(qRunTime)) * time.Nanosecond)
+		case cfg.maxPerSecond > 0:
+			dtime := float64(time.Now().UnixNano() - qStartAt)
+			sleep := float64(numSelected) * 1000000000 / float64(cfg.maxPerSecond) - dtime
+			if sleep > 0 {
+				time.Sleep(time.Duration(int64(sleep)) * time.Nanosecond)
 			}
-			result := response.Results[0]
-
-			if len(result.Series) != 1 {
-				clog.Fatal("Incorrect responce for '" + sql + "'")
-			}
-			serie := result.Series[0]
-
-			if len(serie.Columns) != 2 || serie.Columns[0] != "time" || serie.Columns[1] != "sum" {
-				clog.Fatal("Incorrect columns '", serie.Columns, "' for '" + sql + "'")
-			}
-
-			for _, row := range serie.Values {
-				if len(row) != 2 {
-					clog.Fatal(len(row), " (must be 2) fields in row for '" + sql + "'")
-				}
-
-				if row[1] == nil {
-					// no data for this time point
-					continue
-				}
-
-				timeVl, err1 := row[0].(json.Number).Int64()
-				if err1 != nil {
-					clog.Fatal("Can't parse time from influx output as int64 ", err1.Error())
-				}
-				timeVls := timeVl / 1000000000 - janFirst2017UTC
-				if timeVls > math.MaxUint32 {
-					clog.Fatal("Time if to far in future - can't be represented as uint32")
-				}
-				data.times = append(data.times, uint32(timeVls))
-
-				dataVl, err2 := row[1].(json.Number).Float64()
-				if err2 != nil {
-					clog.Fatal("Can't parse data from influx output as float64 ", err2.Error())
-				}
-				data.values = append(data.values, uint64(dataVl * 1000))
-			}
-		} else {
-			cerr := err
-			if cerr == nil {
-				cerr = response.Error()
-			}
-			clog.Fatal("Error executing '" + sql + "': ", cerr.Error())
 		}
 	}
-	return &data
+	return nil, &data
 }
 
 
@@ -272,10 +314,10 @@ func fillConfig(cfg * config) {
 	}
 
 	maxPoints := 9500
-	if maxPtStr, maxPtOk := cfg.params["maxpts"] ; maxPtOk {
+	if maxPtStr, maxPtOk := cfg.params["maxperselect"] ; maxPtOk {
 		vl, err := strconv.Atoi(maxPtStr)
 		if err != nil {
-			clog.Fatal("Wrong 'maxpts' value. Mast be integer")
+			clog.Fatal("Wrong 'maxperselect' value. Mast be integer")
 		}
 		maxPoints = vl
 	}
@@ -283,6 +325,22 @@ func fillConfig(cfg * config) {
 	cfg.maxResultPoints = int(to.Sub(from).Seconds() / step.Seconds()) + 1
 	cfg.maxResultPoints += cfg.maxResultPoints / maxPoints + 1
 
+	cfg.maxPerSecond = 0
+	if maxPerSecondStr, maxPtOk := cfg.params["maxpersecond"] ; maxPtOk {
+		vl, err := strconv.Atoi(maxPerSecondStr)
+		if err != nil {
+			clog.Fatal("Wrong 'maxpersecond' value. Mast be integer")
+		}
+		cfg.maxPerSecond = vl
+	}
+
+	if cfg.maxPerSecond > 0 {
+		if cfg.maxPerSecond < maxPoints {
+			clog.Fatal("maxpersecond(=", cfg.maxPerSecond, ") must be >= maxperselect(=", maxPoints, ")")
+		}
+	} else if cfg.maxPerSecond < -1 {
+		clog.Fatal("maxpersecond(=", cfg.maxPerSecond, ") must be >= -1")
+	}
 	maxStepDuration := int64(maxPoints) * int64(step.Seconds())
 	currTime := from
 
@@ -426,8 +484,20 @@ func main() {
 		outFD = nil
 	}
 
+	selectors := make([]string, len(*series))
+	idx := 0
 	for selector := range *series {
-		data := mirrorSerie(cfg, selector2SQL(selector), conn)
+		selectors[idx] = selector
+		idx++
+	}
+
+	sort.Strings(selectors)
+
+	for _, selector := range selectors {
+		err, data := mirrorSerie(cfg, selector2SQL(selector), conn)
+		if err != nil {
+			clog.Fatal("Failed to select data:", err.Error())
+		}
 		data.serie = selector
 
 		wbuff := packSerie(data)

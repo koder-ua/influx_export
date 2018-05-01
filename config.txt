@@ -1,7 +1,9 @@
 from=2017-01-01T00:00:10
-to=2017-01-01T01:24:00
+to=2017-01-01T23:59:00
 step=2s
-maxpts=512
+maxperselect=5000
+maxpersecond=-1
+
 cpu region='us-west'
 
 #libvirt_domain_block_stats_read_bytes_total AND target_device =~ /vd[a-z]+$/

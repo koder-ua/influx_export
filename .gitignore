@@ -3,6 +3,7 @@
 *.dll
 *.so
 *.dylib
+influx_sync
 
 # Test binary, build with `go test -c`
 *.test
