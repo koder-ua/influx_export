@@ -3,22 +3,22 @@ package main
 import (
 	"os"
 	"io"
+	"fmt"
+	"sort"
 	"time"
+	"math"
+	"bytes"
 	"bufio"
+	"errors"
 	"regexp"
 	"strconv"
 	"strings"
+	"encoding/json"
 	"encoding/binary"
 
 	"github.com/influxdata/influxdb/client/v2"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"encoding/json"
-	"math"
-	"bytes"
-	"errors"
-	"fmt"
-	"sort"
 )
 
 const IdentPattern = "[a-zA-Z_][a-zA-Z_0-9]+"
@@ -39,14 +39,25 @@ type config struct {
 	outputFname string
 	maxPerSecond int
 	checkUnpack bool
+	listOnly    bool
+	maxSeriesToList int
 }
+
+
+type SerieData struct {
+	times []uint32
+	values []uint64
+	serie string
+}
+
+
+var clog = logrus.New()
 
 
 func makeConfig() *config {
 	return &config{params: make(map[string]string), checkUnpack: false}
 }
 
-var clog = logrus.New()
 
 func setupLogging(level string, output io.Writer) {
 	clog.Formatter = new(logrus.TextFormatter)
@@ -64,38 +75,6 @@ func setupLogging(level string, output io.Writer) {
 	}
 	clog.Out = output
 }
-
-//func openLogFD(silent bool, fname string) (io.Writer, func()) {
-//	var fd io.Writer
-//	var logFD *os.File
-//	deferClose := func(){}
-//
-//	if fname != "" {
-//		var err error
-//		logFD, err = os.OpenFile(fname, os.O_RDWR | os.O_CREATE | os.O_APPEND, 0644)
-//		if err != nil {
-//			log.Fatalf("Error opening file %s: %v", fname, err)
-//		}
-//		deferClose = func(){logFD.Close()}
-//	}
-//
-//	if silent {
-//		if logFD == nil {
-//			var err error
-//			logFD, err = os.OpenFile("/dev/null", os.O_RDWR | os.O_CREATE | os.O_APPEND, 0644)
-//			if err != nil {
-//				log.Fatalf("Error opening file %s: %v", fname, err)
-//			}
-//			deferClose = func(){logFD.Close()}
-//		}
-//		fd = logFD
-//	} else {
-//		if logFD != nil {
-//			fd = io.MultiWriter(os.Stdout, logFD)
-//		}
-//	}
-//	return fd, deferClose
-//}
 
 
 func parseCfg(cfg *config) {
@@ -168,13 +147,6 @@ func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
 }
 
 
-type SerieData struct {
-	times []uint32
-	values []uint64
-	serie string
-}
-
-
 func runSQLToData(sql string, database string, conn client.Client, data *SerieData,
 				  startTm int64) (error, int, int64, int64) {
 
@@ -218,7 +190,7 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 					if err1 != nil {
 						return errors.New("can't parse time from influx output as int64 " + err1.Error()), 0, 0, 0
 					}
-					timeVls := timeVl/1000000000 - startTm
+					timeVls := timeVl / 1000000000 - startTm
 					if timeVls > math.MaxUint32 {
 						return errors.New("time if to far in future - can't be represented as uint32"), 0, 0, 0
 					}
@@ -228,7 +200,7 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 					if err2 != nil {
 						return errors.New("can't parse data from influx output as float64 " + err2.Error()), 0, 0, 0
 					}
-					data.values = append(data.values, uint64(dataVl*1000))
+					data.values = append(data.values, uint64(dataVl * 1000))
 				}
 			}
 		}
@@ -241,6 +213,7 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 		return cerr, 0, 0, 0
 	}
 }
+
 
 func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieData) {
 	clog.Info("Selecting '", query, "' serie")
@@ -374,13 +347,14 @@ func selector2SQL(selector string) string {
 		if len(nameAndVal) != 2 {
 			clog.Fatal("Incorrect serie selector '" + selector + "'")
 		}
-		res += nameAndVal[0] + "='" + nameAndVal[1] + "' "
+		res += "\"" + nameAndVal[0] + "\"" + "='" + nameAndVal[1] + "' "
 		if idx != len(parts) - 2 {
 			res += "AND "
 		}
 	}
 	return res
 }
+
 
 func packSerie(data *SerieData) []byte {
 	bname := []byte(data.serie)
@@ -446,25 +420,6 @@ func mapValues(mp *map[string]bool) []string {
 }
 
 
-func parseCLI(version string, cfg *config) {
-	app := kingpin.New(os.Args[0], "Influxdb data exporter")
-	app.Flag("url", "Server url").Short('U').PlaceHolder("PROTO://IP:PORT").
-		Default("http://localhost:8086").StringVar(&cfg.url)
-	app.Flag("name", "User name").Short('u').PlaceHolder("NAME").StringVar(&cfg.user)
-	app.Flag("password", "User pwd").Short('p').PlaceHolder("PASSWORD").
-		StringVar(&cfg.passwd)
-	app.Flag("db", "Database").Short('d').PlaceHolder("DATABASE").StringVar(&cfg.database)
-	app.Flag("output", "output file").Short('o').PlaceHolder("FILENAME").Default("").
-		StringVar(&cfg.outputFname)
-	app.Flag("loglevel", "Log level (default = DEBUG)").Short('l').Default("DEBUG").
-		EnumVar(&cfg.logLevel, "DEBUG", "INFO", "WARNING", "ERROR", "FATAL")
-	app.Flag("check", "Check unpack of data").BoolVar(&cfg.checkUnpack)
-	app.Arg("config", "Config file.").Required().StringVar(&cfg.configName)
-	app.Version(version)
-	app.Parse(os.Args[1:])
-}
-
-
 func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
 	if s1.serie != s2.serie || len(s1.values) != len(s2.values) {
 		return false
@@ -495,20 +450,23 @@ func testUnpack(origin *SerieData, rbuff *bytes.Buffer) {
 }
 
 
-func main() {
-	cfg := makeConfig()
-	parseCLI("0.0.1", cfg)
-	setupLogging(cfg.logLevel, os.Stdout)
-	parseCfg(cfg)
-	fillConfig(cfg)
-	clog.Info(cfg.seriesReq)
+func DoMirror(cfg *config) {
 
 	conn := newConn(cfg)
 
 	series := listAllSeries(cfg, conn)
-	clog.Info("Find ", len(*series), " series")
-	for selector := range *series {
+
+	selectors := mapValues(series)
+	for idx, selector := range selectors {
+		if idx == cfg.maxSeriesToList + 1 {
+			clog.Debug("...")
+			break
+		}
 		clog.Debug("    ", selector)
+	}
+
+	if cfg.listOnly {
+		return
 	}
 
 	clog.Info("Range would be splitted in to ", len(cfg.timePoints) - 1, " subranges")
@@ -528,18 +486,25 @@ func main() {
 		outFD = nil
 	}
 
-	selectors := mapValues(series)
 	sort.Strings(selectors)
 
 	for _, selector := range selectors {
+		startTm := time.Now().UnixNano()
 		err, data := mirrorSerie(cfg, selector2SQL(selector), conn)
 		if err != nil {
 			clog.Fatal("Failed to select data:", err.Error())
 		}
+		selectTimeMS := (time.Now().UnixNano() - startTm)/1000000
+
+		if len(data.times) == 0 {
+			continue
+		}
+		
 		data.serie = selector
 
 		wbuff := packSerie(data)
-		clog.Info(len(data.times), " points selected for ", data.serie, ". Packed into ", len(wbuff), " bytes")
+		clog.Info(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %d bytes",
+							  len(data.times), data.serie, selectTimeMS, len(wbuff)))
 
 		if cfg.checkUnpack {
 			testUnpack(data, bytes.NewBuffer(wbuff))
@@ -549,4 +514,44 @@ func main() {
 			outFD.Write(wbuff)
 		}
 	}
+}
+
+
+func parseCLI(version string, cfg *config) {
+	app := kingpin.New(os.Args[0], "Influxdb data exporter")
+	app.Flag("url", "Server url").Short('U').PlaceHolder("PROTO://IP:PORT").
+		Default("http://localhost:8086").StringVar(&cfg.url)
+	app.Flag("name", "User name").Short('u').PlaceHolder("NAME").StringVar(&cfg.user)
+	app.Flag("password", "User pwd").Short('p').PlaceHolder("PASSWORD").
+		StringVar(&cfg.passwd)
+	app.Flag("db", "Database").Short('d').PlaceHolder("DATABASE").StringVar(&cfg.database)
+	app.Flag("output", "output file").Short('o').PlaceHolder("FILENAME").Default("").
+		StringVar(&cfg.outputFname)
+	app.Flag("loglevel", "Log level (default = DEBUG)").Short('l').Default("DEBUG").
+		EnumVar(&cfg.logLevel, "DEBUG", "INFO", "WARNING", "ERROR", "FATAL")
+	app.Flag("check", "Check unpack of data").Short('c').BoolVar(&cfg.checkUnpack)
+	app.Flag("list-only", "Only list matched timeseries").Short('L').BoolVar(&cfg.listOnly)
+	app.Flag("max-list", "Max series to list").Short('m').Default("25").
+		IntVar(&cfg.maxSeriesToList)
+	app.Arg("config", "Config file").Required().StringVar(&cfg.configName)
+	app.Version(version)
+	_, err := app.Parse(os.Args[1:])
+	if err != nil {
+		clog.Fatal("Fail to parse CLI: ", err.Error())
+	}
+	clog.Info(cfg.configName)
+}
+
+
+func main() {
+	cfg := makeConfig()
+	parseCLI("0.0.1", cfg)
+
+	setupLogging(cfg.logLevel, os.Stdout)
+	parseCfg(cfg)
+	fillConfig(cfg)
+
+	clog.Info(cfg.seriesReq)
+
+	DoMirror(cfg)
 }

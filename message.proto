@@ -1,0 +1,13 @@
+syntax = "proto3";
+package main;
+
+message DataPoint {
+    uint32 time = 1;
+    uint64 value = 2;
+}
+
+
+message SerieData {
+    string query = 1;
+    repeated DataPoint points = 2;
+}
