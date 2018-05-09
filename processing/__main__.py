@@ -1,9 +1,9 @@
+import re
 import sys
 import argparse
 from typing import Any, List
 from pathlib import Path
 
-import numpy
 import seaborn as sns
 from matplotlib import pyplot
 
@@ -23,17 +23,18 @@ def parse_args(args: List[str]) -> Any:
 
 
 def process_file(fname: str):
-    count = 0
-    total = 0
+    ceph_disk_io_aggregate = None
     with make_storage("raw", fname) as src:
         for idx, rec in enumerate(src):
-            if rec.metric == "diskio_write_bytes":
-                df = make_diff(rec.vals)
-                pyplot.plot(numpy.cumsum(df))
-                pyplot.plot(rec.vals.clip(0, 10000000))
-                pyplot.show()
-                return
-    print(count, total)
+            if rec.metric == "diskio_write_bytes" and re.match("ceph\\d+", rec.tags['host']):
+                diff = make_diff(rec.vals)
+                if ceph_disk_io_aggregate is None:
+                    ceph_disk_io_aggregate = diff[:11270]
+                elif len(diff) >= 11270:
+                    ceph_disk_io_aggregate += diff[:11270]
+
+    pyplot.plot(ceph_disk_io_aggregate)
+    pyplot.show()
 
 
 def main(argv: List[str]) -> int:

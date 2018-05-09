@@ -1,63 +1,63 @@
 package main
 
 import (
-	"os"
-	"io"
-	"fmt"
-	"sort"
-	"time"
-	"math"
-	"bytes"
 	"bufio"
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
-	"encoding/json"
-	"encoding/binary"
+	"time"
 
 	"github.com/influxdata/influxdb/client/v2"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/tysonmote/gommap"
 )
 
 const IdentPattern = "[a-zA-Z_][a-zA-Z_0-9]+"
 const TimeFormat = "2006-01-02T15:04:05"
 
 type config struct {
-	seriesReq  [] string
-	params     map[string]string
-	step       string
-	url        string
-	user       string
-	passwd     string
-	database   string
-	logLevel   string
-	configName string
-	timePoints [] string
+	seriesReq       []string
+	params          map[string]string
+	step            string
+	url             string
+	user            string
+	passwd          string
+	database        string
+	logLevel        string
+	configName      string
+	timePoints      []string
 	maxResultPoints int
-	outputFname string
-	maxPerSecond int
-	checkUnpack bool
-	listOnly    bool
+	outputFname     string
+	maxPerSecond    int
+	checkUnpack     bool
+	listOnly        bool
 	maxSeriesToList int
+	resume          bool
+	resumeOk        bool
+	readySeries     map[string]bool
 }
-
 
 type SerieData struct {
-	times []uint32
+	times  []uint32
 	values []uint64
-	serie string
+	serie  string
 }
 
-
 var clog = logrus.New()
-
 
 func makeConfig() *config {
 	return &config{params: make(map[string]string), checkUnpack: false}
 }
-
 
 func setupLogging(level string, output io.Writer) {
 	clog.Formatter = new(logrus.TextFormatter)
@@ -75,7 +75,6 @@ func setupLogging(level string, output io.Writer) {
 	}
 	clog.Out = output
 }
-
 
 func parseCfg(cfg *config) {
 	clog.Info("Load config from ", cfg.configName)
@@ -106,7 +105,6 @@ func parseCfg(cfg *config) {
 	}
 }
 
-
 func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
 	series := make(map[string]bool)
 
@@ -115,7 +113,7 @@ func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
 		if len(parts) == 0 {
 			clog.Fatal("Error in config file at line ", lineno, " must be in format SERIE_NAME [FILTER_EXPR]")
 		}
-		if matched, _ := regexp.MatchString("[a-zA-Z_][a-zA-Z_0-9]*", parts[0]) ; !matched {
+		if matched, _ := regexp.MatchString("[a-zA-Z_][a-zA-Z_0-9]*", parts[0]); !matched {
 			clog.Fatal("Error in config file at line ", lineno,
 				". Bad serie name, must be in format SERIE_NAME [FILTER_EXPR]")
 		}
@@ -146,9 +144,8 @@ func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
 	return &series
 }
 
-
 func runSQLToData(sql string, database string, conn client.Client, data *SerieData,
-				  startTm int64) (error, int, int64, int64) {
+	startTm int64) (error, int, int64, int64) {
 
 	q := client.NewQuery(sql, database, "s")
 
@@ -190,7 +187,12 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 					if err1 != nil {
 						return errors.New("can't parse time from influx output as int64 " + err1.Error()), 0, 0, 0
 					}
-					timeVls := timeVl / 1000000000 - startTm
+
+					if timeVl < startTm {
+						return errors.New("time is before startTm"), 0, 0, 0
+					}
+
+					timeVls := timeVl - startTm
 					if timeVls > math.MaxUint32 {
 						return errors.New("time if to far in future - can't be represented as uint32"), 0, 0, 0
 					}
@@ -200,7 +202,7 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 					if err2 != nil {
 						return errors.New("can't parse data from influx output as float64 " + err2.Error()), 0, 0, 0
 					}
-					data.values = append(data.values, uint64(dataVl * 1000))
+					data.values = append(data.values, uint64(dataVl*1000))
 				}
 			}
 		}
@@ -214,26 +216,25 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 	}
 }
 
-
 func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieData) {
-	clog.Info("Selecting '", query, "' serie")
 	data := SerieData{
-		times: make([]uint32, 0, cfg.maxResultPoints),
+		times:  make([]uint32, 0, cfg.maxResultPoints),
 		values: make([]uint64, 0, cfg.maxResultPoints),
 	}
 
 	janFirst2017UTC := time.Date(2017, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 
-	for idx := 0 ; idx < len(cfg.timePoints) - 1 ; idx++ {
+	for idx := 0; idx < len(cfg.timePoints)-1; idx++ {
 		frm := cfg.timePoints[idx]
-		to := cfg.timePoints[idx + 1]
+		to := cfg.timePoints[idx+1]
+
 		sql := fmt.Sprintf("SELECT sum(value) FROM %s AND time>='%s' AND time<'%s' GROUP BY time(%s)",
-							query, frm, to, cfg.step)
+			query, frm, to, cfg.step)
 
 		err, numSelected, qStartAt, qRunTime := runSQLToData(sql, cfg.database, conn, &data, janFirst2017UTC)
 
 		if err != nil {
-			return errors.New("during '" + sql + "' :" + err.Error()), nil
+			return errors.New("during '" + query + "' :" + err.Error()), nil
 		}
 
 		switch {
@@ -244,7 +245,7 @@ func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieDa
 			time.Sleep(time.Duration(int64(qRunTime)) * time.Nanosecond)
 		case cfg.maxPerSecond > 0:
 			dtime := float64(time.Now().UnixNano() - qStartAt)
-			sleep := float64(numSelected) * 1000000000 / float64(cfg.maxPerSecond) - dtime
+			sleep := float64(numSelected)*1000000000/float64(cfg.maxPerSecond) - dtime
 			if sleep > 0 {
 				time.Sleep(time.Duration(int64(sleep)) * time.Nanosecond)
 			}
@@ -253,10 +254,9 @@ func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieDa
 	return nil, &data
 }
 
-
-func fillConfig(cfg * config) {
+func fillConfig(cfg *config) {
 	for _, name := range []string{"from", "to", "step"} {
-		if  _, hasKey := cfg.params[name] ; !hasKey {
+		if _, hasKey := cfg.params[name]; !hasKey {
 			clog.Fatal("Key '" + name + "' must be in config file")
 		}
 	}
@@ -264,13 +264,13 @@ func fillConfig(cfg * config) {
 	cfg.step = cfg.params["step"]
 
 	var from, to time.Time
-	if tfrom, err := time.Parse(TimeFormat, cfg.params["from"]) ; err != nil {
+	if tfrom, err := time.Parse(TimeFormat, cfg.params["from"]); err != nil {
 		clog.Fatal("Can't parse 'from' date in config file: ", err.Error())
 	} else {
 		from = tfrom
 	}
 
-	if tto, err := time.Parse(TimeFormat, cfg.params["to"]) ; err != nil {
+	if tto, err := time.Parse(TimeFormat, cfg.params["to"]); err != nil {
 		clog.Fatal("Can't parse 'from' date in config file: ", err.Error())
 	} else {
 		to = tto
@@ -281,14 +281,14 @@ func fillConfig(cfg * config) {
 	}
 
 	var step time.Duration
-	if tstep, err := time.ParseDuration(cfg.step) ; err != nil {
+	if tstep, err := time.ParseDuration(cfg.step); err != nil {
 		clog.Fatal("Can't parse 'step' duration field in config file: ", err.Error())
 	} else {
 		step = tstep
 	}
 
 	maxPoints := 9500
-	if maxPtStr, maxPtOk := cfg.params["maxperselect"] ; maxPtOk {
+	if maxPtStr, maxPtOk := cfg.params["maxperselect"]; maxPtOk {
 		vl, err := strconv.Atoi(maxPtStr)
 		if err != nil {
 			clog.Fatal("Wrong 'maxperselect' value. Mast be integer")
@@ -296,11 +296,11 @@ func fillConfig(cfg * config) {
 		maxPoints = vl
 	}
 
-	cfg.maxResultPoints = int(to.Sub(from).Seconds() / step.Seconds()) + 1
-	cfg.maxResultPoints += cfg.maxResultPoints / maxPoints + 1
+	cfg.maxResultPoints = int(to.Sub(from).Seconds()/step.Seconds()) + 1
+	cfg.maxResultPoints += cfg.maxResultPoints/maxPoints + 1
 
 	cfg.maxPerSecond = 0
-	if maxPerSecondStr, maxPtOk := cfg.params["maxpersecond"] ; maxPtOk {
+	if maxPerSecondStr, maxPtOk := cfg.params["maxpersecond"]; maxPtOk {
 		vl, err := strconv.Atoi(maxPerSecondStr)
 		if err != nil {
 			clog.Fatal("Wrong 'maxpersecond' value. Mast be integer")
@@ -319,12 +319,12 @@ func fillConfig(cfg * config) {
 	currTime := from
 
 	for currTime.Before(to) {
-		cfg.timePoints = append(cfg.timePoints, currTime.Format(TimeFormat) + ".0Z")
+		cfg.timePoints = append(cfg.timePoints, currTime.Format(TimeFormat)+".0Z")
 		currTime = currTime.Add(time.Duration(maxStepDuration) * time.Second)
 	}
-	cfg.timePoints = append(cfg.timePoints, to.Format(TimeFormat) + ".0Z")
+	cfg.timePoints = append(cfg.timePoints, to.Format(TimeFormat)+".0Z")
+	cfg.resumeOk = false
 }
-
 
 func newConn(cfg *config) client.Client {
 	conn, err := client.NewHTTPClient(client.HTTPConfig{
@@ -338,7 +338,6 @@ func newConn(cfg *config) client.Client {
 	return conn
 }
 
-
 func selector2SQL(selector string) string {
 	parts := strings.Split(selector, ",")
 	res := parts[0] + " WHERE "
@@ -348,40 +347,38 @@ func selector2SQL(selector string) string {
 			clog.Fatal("Incorrect serie selector '" + selector + "'")
 		}
 		res += "\"" + nameAndVal[0] + "\"" + "='" + nameAndVal[1] + "' "
-		if idx != len(parts) - 2 {
+		if idx != len(parts)-2 {
 			res += "AND "
 		}
 	}
 	return res
 }
 
-
 func packSerie(data *SerieData) []byte {
 	bname := []byte(data.serie)
-	buff := make([]byte, len(bname) + 1 + 4 + len(data.values) * (8 + 4))
+	buff := make([]byte, len(bname)+1+4+len(data.values)*(8+4))
 	copy(buff, bname)
 	offset := len(bname) + 1
-	buff[offset - 1] = byte(0)
+	buff[offset-1] = byte(0)
 
-	binary.BigEndian.PutUint32(buff[offset: offset + 4], uint32(len(data.values)))
+	binary.BigEndian.PutUint32(buff[offset:offset+4], uint32(len(data.values)))
 	offset += 4
 
 	for _, vl := range data.values {
-		binary.BigEndian.PutUint64(buff[offset: offset + 8], vl)
+		binary.BigEndian.PutUint64(buff[offset:offset+8], vl)
 		offset += 8
 	}
 	for _, vl := range data.times {
-		binary.BigEndian.PutUint32(buff[offset: offset + 4], vl)
+		binary.BigEndian.PutUint32(buff[offset:offset+4], vl)
 		offset += 4
 	}
 	return buff
 }
 
-
-func unpackSerie(buff *bytes.Buffer) (*SerieData, error) {
+func unpackSerie(buff *bytes.Buffer, unpackData bool) (*SerieData, error) {
 	selector, err := buff.ReadString(byte(0))
 	if err != nil {
-		return nil, errors.New("corrupted data found during array size extranction: " + err.Error())
+		return nil, errors.New("corrupted data found during name extranction: " + err.Error())
 	}
 
 	if len(selector) == 1 {
@@ -389,25 +386,30 @@ func unpackSerie(buff *bytes.Buffer) (*SerieData, error) {
 	}
 
 	dataSize := binary.BigEndian.Uint32(buff.Next(4))
-	if buff.Len() < (8 + 4) * int(dataSize) {
+	if buff.Len() < (8+4)*int(dataSize) {
 		return nil, errors.New("corrupted data found during array data/time extranction")
 	}
 
 	data := SerieData{
-		times: make([]uint32, 0, dataSize),
-		values: make([]uint64, 0, dataSize),
-		serie: selector[:len(selector) - 1],
+		serie:  selector[:len(selector)-1],
 	}
 
-	for i := uint32(0); i < dataSize ; i++ {
-		data.values = append(data.values, binary.BigEndian.Uint64(buff.Next(8)))
+	if (unpackData) {
+		data.times = make([]uint32, 0, dataSize)
+		data.values = make([]uint64, 0, dataSize)
+
+		for i := uint32(0); i < dataSize; i++ {
+			data.values = append(data.values, binary.BigEndian.Uint64(buff.Next(8)))
+		}
+		for i := uint32(0); i < dataSize; i++ {
+			data.times = append(data.times, binary.BigEndian.Uint32(buff.Next(4)))
+		}
+		return &data, nil
+	} else {
+		buff.Next(12 * int(dataSize))
+		return &data, nil
 	}
-	for i := uint32(0); i < dataSize ; i++ {
-		data.times = append(data.times, binary.BigEndian.Uint32(buff.Next(4)))
-	}
-	return &data, nil
 }
-
 
 func mapValues(mp *map[string]bool) []string {
 	res := make([]string, len(*mp))
@@ -418,7 +420,6 @@ func mapValues(mp *map[string]bool) []string {
 	}
 	return res
 }
-
 
 func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
 	if s1.serie != s2.serie || len(s1.values) != len(s2.values) {
@@ -433,9 +434,8 @@ func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
 	return true
 }
 
-
 func testUnpack(origin *SerieData, rbuff *bytes.Buffer) {
-	v, e := unpackSerie(rbuff)
+	v, e := unpackSerie(rbuff, true)
 	if e != nil {
 		clog.Fatal("Failed to unpack ", e.Error())
 	}
@@ -450,6 +450,43 @@ func testUnpack(origin *SerieData, rbuff *bytes.Buffer) {
 }
 
 
+func FindReadySeries(cfg *config) error {
+	if cfg.outputFname == "" {
+		return errors.New("No output file provided to resume")
+	}
+
+	if _, err := os.Stat(cfg.outputFname); os.IsNotExist(err) {
+		clog.Info("No output file exists - will start from beginning")
+		return nil
+	}
+
+	dataFD, err := os.OpenFile(cfg.outputFname, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer dataFD.Close()
+	mmap, err := gommap.Map(dataFD.Fd(), gommap.PROT_READ, gommap.MAP_PRIVATE)
+	if err != nil {
+		return err
+	}
+	defer mmap.UnsafeUnmap()
+
+	cfg.readySeries = make(map[string]bool)
+	buff := bytes.NewBuffer(mmap)
+	for buff.Len() > 0 {
+		data, err := unpackSerie(buff, false)
+		if err != nil {
+			return err
+		}
+		cfg.readySeries[data.serie] = true
+	}
+
+	clog.Info("Find ", len(cfg.readySeries), " already processed series. Will skip them")
+	cfg.resumeOk = true
+	return nil
+}
+
+
 func DoMirror(cfg *config) {
 
 	conn := newConn(cfg)
@@ -458,7 +495,7 @@ func DoMirror(cfg *config) {
 
 	selectors := mapValues(series)
 	for idx, selector := range selectors {
-		if idx == cfg.maxSeriesToList + 1 {
+		if idx == cfg.maxSeriesToList+1 {
 			clog.Debug("...")
 			break
 		}
@@ -469,43 +506,84 @@ func DoMirror(cfg *config) {
 		return
 	}
 
-	clog.Info("Range would be splitted in to ", len(cfg.timePoints) - 1, " subranges")
-	for idx := 0 ; idx < len(cfg.timePoints) - 1 ; idx++ {
-		clog.Debug("    ", cfg.timePoints[idx], " - ", cfg.timePoints[idx + 1])
+	clog.Info("Range would be splitted in to ", len(cfg.timePoints)-1, " subranges")
+	for idx := 0; idx < len(cfg.timePoints)-1; idx++ {
+		clog.Debug("    ", cfg.timePoints[idx], " - ", cfg.timePoints[idx+1])
 	}
 
 	var outFD *os.File
 	if cfg.outputFname != "" {
-		outF, err := os.OpenFile(cfg.outputFname, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, 0666)
+		var mode int
+		if cfg.resume && cfg.resumeOk {
+			mode = os.O_WRONLY
+		} else {
+			mode = os.O_WRONLY|os.O_CREATE|os.O_TRUNC
+		}
+		outF, err := os.OpenFile(cfg.outputFname, mode, 0666)
 		if err != nil {
 			clog.Fatal("Fail to open output file '", cfg.outputFname, "'. Error:", err.Error())
 		}
 		defer outF.Close()
 		outFD = outF
+
+		if cfg.resume && cfg.resumeOk {
+			outFD.Seek(0, 2)
+		}
 	} else {
 		outFD = nil
 	}
 
 	sort.Strings(selectors)
+	pperc := 0
 
-	for _, selector := range selectors {
-		startTm := time.Now().UnixNano()
+	stime := time.Now()
+	totalSize := uint64(0)
+
+	if cfg.resumeOk {
+		filtered_selectors := make([]string, 0, len(selectors) - len(cfg.readySeries))
+		for _, selector := range selectors {
+			if _, ok := cfg.readySeries[selector] ; !ok {
+				filtered_selectors = append(filtered_selectors, selector)
+			}
+		}
+		selectors = filtered_selectors
+	}
+
+	expectedSize := len(selectors) * (cfg.maxResultPoints*12 + 200)
+	clog.Info("Will totally select ", len(selectors),
+		" series. Results data size would be around ", expectedSize/1024, " KiB")
+
+	startTm := time.Now().UnixNano()
+	for idx, selector := range selectors {
+
+		clog.Info("Selecting '", selector, "' serie")
 		err, data := mirrorSerie(cfg, selector2SQL(selector), conn)
 		if err != nil {
 			clog.Fatal("Failed to select data:", err.Error())
 		}
-		selectTimeMS := (time.Now().UnixNano() - startTm)/1000000
 
+		selectTimeMS := (time.Now().UnixNano() - startTm) / 1000000
 		if len(data.times) == 0 {
 			continue
 		}
-		
+
 		data.serie = selector
-
 		wbuff := packSerie(data)
-		clog.Info(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %d bytes",
-							  len(data.times), data.serie, selectTimeMS, len(wbuff)))
 
+		cperc := (idx + 1) * 100 / len(selectors)
+
+		if (idx + 1) != len(selectors) && cperc > pperc {
+			usedS := time.Now().Sub(stime).Nanoseconds() / 1000000000
+			secondsLeft := float64(usedS) / float64((idx + 1)) * float64(len(selectors)-(idx + 1))
+			left := time.Duration(int(secondsLeft)) * time.Second
+			clog.Info(cperc, "% of all series selected. Approximatelly ", left,
+				" left. Total ", totalSize/1024/1024, " MiB data written")
+			pperc = cperc
+		}
+		clog.Debug(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %d bytes",
+			len(data.times), data.serie, selectTimeMS, len(wbuff)))
+
+		totalSize += uint64(len(wbuff))
 		if cfg.checkUnpack {
 			testUnpack(data, bytes.NewBuffer(wbuff))
 		}
@@ -514,8 +592,8 @@ func DoMirror(cfg *config) {
 			outFD.Write(wbuff)
 		}
 	}
+	clog.Info("Finished. Total ", totalSize/1024/1024, " MiB of data written")
 }
-
 
 func parseCLI(version string, cfg *config) {
 	app := kingpin.New(os.Args[0], "Influxdb data exporter")
@@ -533,6 +611,7 @@ func parseCLI(version string, cfg *config) {
 	app.Flag("list-only", "Only list matched timeseries").Short('L').BoolVar(&cfg.listOnly)
 	app.Flag("max-list", "Max series to list").Short('m').Default("25").
 		IntVar(&cfg.maxSeriesToList)
+	app.Flag("resume", "Resume previously interrupted operation").Short('r').BoolVar(&cfg.resume)
 	app.Arg("config", "Config file").Required().StringVar(&cfg.configName)
 	app.Version(version)
 	_, err := app.Parse(os.Args[1:])
@@ -541,7 +620,6 @@ func parseCLI(version string, cfg *config) {
 	}
 	clog.Info(cfg.configName)
 }
-
 
 func main() {
 	cfg := makeConfig()
@@ -553,5 +631,11 @@ func main() {
 
 	clog.Info(cfg.seriesReq)
 
+	if (cfg.resume) {
+		err := FindReadySeries(cfg)
+		if err != nil {
+			clog.Fatal("Can't resume: " + err.Error())
+		}
+	}
 	DoMirror(cfg)
 }

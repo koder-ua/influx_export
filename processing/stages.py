@@ -1,5 +1,4 @@
 from functools import wraps
-import itertools
 from typing import List, Tuple, Dict, Callable, Iterable
 
 import numpy
