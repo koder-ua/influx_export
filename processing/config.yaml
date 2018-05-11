@@ -1,0 +1,6 @@
+storages:
+    hdf: hdf5
+
+stages:
+    "diskio_write_bytes": make_diff
+    save:

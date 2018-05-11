@@ -76,3 +76,17 @@ def take(data: Iterable[numpy.ndarray], count: int) -> Iterable[numpy.ndarray]:
         if idx > count:
             break
         yield arr
+
+
+def allign_times(ref_map: Dict[int, int], data: numpy.ndarray, times: numpy.ndarray) -> numpy.ndarray:
+    res = numpy.zeros(len(ref_map), dtype=data.dtype)
+    for tm, vl in zip(data, times):
+        try:
+            res[ref_map[tm]] = vl
+        except KeyError:
+            assert tm > max(ref_map) or tm < min(ref_map)
+    return res
+
+
+def make_times_map(start_time: int, end_time: int, step: int) -> Dict[int, int]:
+    return {tm: idx for idx, tm in enumerate(range(start_time, end_time + step, step))}

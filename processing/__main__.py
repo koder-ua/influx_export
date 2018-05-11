@@ -24,17 +24,43 @@ def parse_args(args: List[str]) -> Any:
 
 def process_file(fname: str):
     ceph_disk_io_aggregate = None
+    max_set = set()
+    with make_storage("raw", fname) as src:
+        for idx, rec in enumerate(src):
+            tset = set(rec.times)
+            max_set.update(tset)
+
     with make_storage("raw", fname) as src:
         for idx, rec in enumerate(src):
             if rec.metric == "diskio_write_bytes" and re.match("ceph\\d+", rec.tags['host']):
+                tset = set(rec.times)
+                extra_points = tset.difference(max_set)
+                missing_points = max_set.difference(tset)
+
+                if not extra_points:
+                    pass
+                elif len(extra_points) > 10:
+                    print(f"{len(extra_points)} extra points")
+                else:
+                    print(f"+{','.join(map(str, sorted(extra_points)))}")
+
+                if not missing_points:
+                    pass
+                elif len(missing_points) > 10:
+                    print(f"{len(missing_points)} missing points")
+                else:
+                    print(f"-{','.join(map(str, sorted(missing_points)))}")
+
+                continue
+
                 diff = make_diff(rec.vals)
                 if ceph_disk_io_aggregate is None:
                     ceph_disk_io_aggregate = diff[:11270]
                 elif len(diff) >= 11270:
                     ceph_disk_io_aggregate += diff[:11270]
 
-    pyplot.plot(ceph_disk_io_aggregate)
-    pyplot.show()
+    #pyplot.plot(ceph_disk_io_aggregate)
+    #pyplot.show()
 
 
 def main(argv: List[str]) -> int:

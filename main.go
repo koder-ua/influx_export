@@ -45,6 +45,7 @@ type config struct {
 	resume          bool
 	resumeOk        bool
 	readySeries     map[string]bool
+	thCount         int
 }
 
 type SerieData struct {
@@ -76,7 +77,7 @@ func setupLogging(level string, output io.Writer) {
 	clog.Out = output
 }
 
-func parseCfg(cfg *config) {
+func parseCfg(cfg *config) error {
 	clog.Info("Load config from ", cfg.configName)
 	file, err := os.Open(cfg.configName)
 	if err != nil {
@@ -86,7 +87,7 @@ func parseCfg(cfg *config) {
 
 	rr, err := regexp.Compile("^" + IdentPattern + "=.*")
 	if err != nil {
-		clog.Fatal("Fail to compile pattern")
+		return err
 	}
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -95,7 +96,7 @@ func parseCfg(cfg *config) {
 			if rr.MatchString(line) {
 				parts := strings.SplitN(line, "=", 2)
 				if _, alreadyHave := cfg.params[parts[0]]; alreadyHave {
-					clog.Fatal("Duplicated key '" + parts[0] + "' in config file")
+					return errors.New("duplicated key '" + parts[0] + "' in config file")
 				}
 				cfg.params[parts[0]] = parts[1]
 			} else {
@@ -103,18 +104,21 @@ func parseCfg(cfg *config) {
 			}
 		}
 	}
+	return nil
 }
 
-func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
+func listAllSeries(cfg *config, conn client.Client) (*map[string]bool, error) {
 	series := make(map[string]bool)
 
 	for lineno, query := range cfg.seriesReq {
 		parts := strings.SplitN(query, " ", 2)
 		if len(parts) == 0 {
-			clog.Fatal("Error in config file at line ", lineno, " must be in format SERIE_NAME [FILTER_EXPR]")
+			return nil, errors.New(
+				"Error in config file at line " + strconv.Itoa(lineno) +
+					" must be in format SERIE_NAME [FILTER_EXPR]")
 		}
 		if matched, _ := regexp.MatchString("[a-zA-Z_][a-zA-Z_0-9]*", parts[0]); !matched {
-			clog.Fatal("Error in config file at line ", lineno,
+			return nil, errors.New("error in config file at line " + strconv.Itoa(lineno) +
 				". Bad serie name, must be in format SERIE_NAME [FILTER_EXPR]")
 		}
 		sql := "SHOW SERIES FROM " + parts[0]
@@ -128,7 +132,7 @@ func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
 			if cerr == nil {
 				cerr = response.Error()
 			}
-			clog.Fatal("Error listing time series: ", cerr.Error())
+			return nil, errors.New("error listing time series: " + cerr.Error())
 		} else {
 			for _, result := range response.Results {
 				for _, row := range result.Series {
@@ -141,11 +145,11 @@ func listAllSeries(cfg *config, conn client.Client) *map[string]bool {
 			}
 		}
 	}
-	return &series
+	return &series, nil
 }
 
 func runSQLToData(sql string, database string, conn client.Client, data *SerieData,
-	startTm int64) (error, int, int64, int64) {
+	startTm int64) (int, int64, int64, error) {
 
 	q := client.NewQuery(sql, database, "s")
 
@@ -153,7 +157,7 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 	if response, err := conn.Query(q); err == nil && response.Error() == nil {
 		qRunTime := time.Now().UnixNano() - qStartAt
 		if len(response.Results) > 1 {
-			return errors.New("incorrect responce (2+ results)"), 0, 0, 0
+			return 0, 0, 0, errors.New("incorrect responce (2+ results)")
 		}
 
 		prevPoints := 0
@@ -161,21 +165,21 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 			result := response.Results[0]
 
 			if len(result.Series) > 1 {
-				return errors.New("incorrect responce (2+ series)"), 0, 0, 0
+				return 0, 0, 0, errors.New("incorrect responce (2+ series)")
 			}
 
 			if len(result.Series) == 1 {
 				serie := result.Series[0]
 
-				if len(serie.Columns) != 2 || serie.Columns[0] != "time" || serie.Columns[1] != "sum" {
-					return errors.New("incorrect columns '" + fmt.Sprintf("%v", serie.Columns)), 0, 0, 0
+				if len(serie.Columns) != 2 || serie.Columns[0] != "time" {
+					return 0, 0, 0, errors.New("incorrect columns '" + fmt.Sprintf("%v", serie.Columns) + "'")
 				}
 
 				prevPoints = len(serie.Values)
 
 				for _, row := range serie.Values {
 					if len(row) != 2 {
-						return errors.New(strconv.Itoa(len(row)) + " (must be 2) fields in row"), 0, 0, 0
+						return 0, 0, 0, errors.New(strconv.Itoa(len(row)) + " (must be 2) fields in row")
 					}
 
 					if row[1] == nil {
@@ -185,38 +189,38 @@ func runSQLToData(sql string, database string, conn client.Client, data *SerieDa
 
 					timeVl, err1 := row[0].(json.Number).Int64()
 					if err1 != nil {
-						return errors.New("can't parse time from influx output as int64 " + err1.Error()), 0, 0, 0
+						return 0, 0, 0, errors.New("can't parse time from influx output as int64 " + err1.Error())
 					}
 
 					if timeVl < startTm {
-						return errors.New("time is before startTm"), 0, 0, 0
+						return 0, 0, 0, errors.New("time is before startTm")
 					}
 
 					timeVls := timeVl - startTm
 					if timeVls > math.MaxUint32 {
-						return errors.New("time if to far in future - can't be represented as uint32"), 0, 0, 0
+						return 0, 0, 0, errors.New("time if to far in future - can't be represented as uint32")
 					}
 					data.times = append(data.times, uint32(timeVls))
 
 					dataVl, err2 := row[1].(json.Number).Float64()
 					if err2 != nil {
-						return errors.New("can't parse data from influx output as float64 " + err2.Error()), 0, 0, 0
+						return 0, 0, 0, errors.New("can't parse data from influx output as float64 " + err2.Error())
 					}
 					data.values = append(data.values, uint64(dataVl*1000))
 				}
 			}
 		}
-		return nil, prevPoints, qStartAt, qRunTime
+		return prevPoints, qStartAt, qRunTime, nil
 	} else {
 		cerr := err
 		if cerr == nil {
 			cerr = response.Error()
 		}
-		return cerr, 0, 0, 0
+		return 0, 0, 0, cerr
 	}
 }
 
-func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieData) {
+func mirrorSerie(cfg *config, query string, conn client.Client) (*SerieData, error) {
 	data := SerieData{
 		times:  make([]uint32, 0, cfg.maxResultPoints),
 		values: make([]uint64, 0, cfg.maxResultPoints),
@@ -228,13 +232,13 @@ func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieDa
 		frm := cfg.timePoints[idx]
 		to := cfg.timePoints[idx+1]
 
-		sql := fmt.Sprintf("SELECT sum(value) FROM %s AND time>='%s' AND time<'%s' GROUP BY time(%s)",
+		sql := fmt.Sprintf("SELECT max(value) FROM %s AND time>='%s' AND time<'%s' GROUP BY time(%s)",
 			query, frm, to, cfg.step)
 
-		err, numSelected, qStartAt, qRunTime := runSQLToData(sql, cfg.database, conn, &data, janFirst2017UTC)
+		numSelected, qStartAt, qRunTime, err := runSQLToData(sql, cfg.database, conn, &data, janFirst2017UTC)
 
 		if err != nil {
-			return errors.New("during '" + query + "' :" + err.Error()), nil
+			return nil, errors.New("during '" + sql + "' :" + err.Error())
 		}
 
 		switch {
@@ -251,13 +255,13 @@ func mirrorSerie(cfg *config, query string, conn client.Client) (error, *SerieDa
 			}
 		}
 	}
-	return nil, &data
+	return &data, nil
 }
 
-func fillConfig(cfg *config) {
+func fillConfig(cfg *config) error {
 	for _, name := range []string{"from", "to", "step"} {
 		if _, hasKey := cfg.params[name]; !hasKey {
-			clog.Fatal("Key '" + name + "' must be in config file")
+			return errors.New("key '" + name + "' must be in config file")
 		}
 	}
 
@@ -265,24 +269,24 @@ func fillConfig(cfg *config) {
 
 	var from, to time.Time
 	if tfrom, err := time.Parse(TimeFormat, cfg.params["from"]); err != nil {
-		clog.Fatal("Can't parse 'from' date in config file: ", err.Error())
+		return errors.New("can't parse 'from' date in config file: " + err.Error())
 	} else {
 		from = tfrom
 	}
 
 	if tto, err := time.Parse(TimeFormat, cfg.params["to"]); err != nil {
-		clog.Fatal("Can't parse 'from' date in config file: ", err.Error())
+		return errors.New("can't parse 'from' date in config file: " + err.Error())
 	} else {
 		to = tto
 	}
 
 	if to.Sub(from).Seconds() < 1 {
-		clog.Fatal("'to' date is before 'from'")
+		return errors.New("'to' date is before 'from'")
 	}
 
 	var step time.Duration
 	if tstep, err := time.ParseDuration(cfg.step); err != nil {
-		clog.Fatal("Can't parse 'step' duration field in config file: ", err.Error())
+		return errors.New("can't parse 'step' duration field in config file: " + err.Error())
 	} else {
 		step = tstep
 	}
@@ -291,7 +295,7 @@ func fillConfig(cfg *config) {
 	if maxPtStr, maxPtOk := cfg.params["maxperselect"]; maxPtOk {
 		vl, err := strconv.Atoi(maxPtStr)
 		if err != nil {
-			clog.Fatal("Wrong 'maxperselect' value. Mast be integer")
+			return errors.New("wrong 'maxperselect' value. Mast be integer")
 		}
 		maxPoints = vl
 	}
@@ -303,17 +307,18 @@ func fillConfig(cfg *config) {
 	if maxPerSecondStr, maxPtOk := cfg.params["maxpersecond"]; maxPtOk {
 		vl, err := strconv.Atoi(maxPerSecondStr)
 		if err != nil {
-			clog.Fatal("Wrong 'maxpersecond' value. Mast be integer")
+			return errors.New("wrong 'maxpersecond' value. Mast be integer")
 		}
 		cfg.maxPerSecond = vl
 	}
 
 	if cfg.maxPerSecond > 0 {
 		if cfg.maxPerSecond < maxPoints {
-			clog.Fatal("maxpersecond(=", cfg.maxPerSecond, ") must be >= maxperselect(=", maxPoints, ")")
+			return errors.New("maxpersecond(=" + strconv.Itoa(cfg.maxPerSecond) +
+				") must be >= maxperselect(=" + strconv.Itoa(maxPoints) + ")")
 		}
 	} else if cfg.maxPerSecond < -1 {
-		clog.Fatal("maxpersecond(=", cfg.maxPerSecond, ") must be >= -1")
+		return errors.New("maxpersecond(=" + strconv.Itoa(cfg.maxPerSecond) + ") must be >= -1")
 	}
 	maxStepDuration := int64(maxPoints) * int64(step.Seconds())
 	currTime := from
@@ -324,18 +329,19 @@ func fillConfig(cfg *config) {
 	}
 	cfg.timePoints = append(cfg.timePoints, to.Format(TimeFormat)+".0Z")
 	cfg.resumeOk = false
+	return nil
 }
 
-func newConn(cfg *config) client.Client {
+func newConn(cfg *config) (client.Client, error) {
 	conn, err := client.NewHTTPClient(client.HTTPConfig{
 		Addr:     cfg.url,
 		Username: cfg.user,
 		Password: cfg.passwd,
 	})
 	if err != nil {
-		clog.Fatal("Error creating InfluxDB Client: ", err.Error())
+		return nil, errors.New("error creating InfluxDB Client: " + err.Error())
 	}
-	return conn
+	return conn, nil
 }
 
 func selector2SQL(selector string) string {
@@ -394,7 +400,7 @@ func unpackSerie(buff *bytes.Buffer, unpackData bool) (*SerieData, error) {
 		serie:  selector[:len(selector)-1],
 	}
 
-	if (unpackData) {
+	if unpackData {
 		data.times = make([]uint32, 0, dataSize)
 		data.values = make([]uint64, 0, dataSize)
 
@@ -434,25 +440,26 @@ func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
 	return true
 }
 
-func testUnpack(origin *SerieData, rbuff *bytes.Buffer) {
+func testUnpack(origin *SerieData, rbuff *bytes.Buffer) error {
 	v, e := unpackSerie(rbuff, true)
 	if e != nil {
-		clog.Fatal("Failed to unpack ", e.Error())
+		return errors.New("failed to unpack " + e.Error())
 	}
 
 	if rbuff.Len() != 0 {
-		clog.Fatal("Extra bytes left after unpacking")
+		return errors.New("extra bytes left after unpacking")
 	}
 
 	if !checkSeriesEQ(v, origin) {
-		clog.Fatal("Unpacking failed")
+		return errors.New("unpacking failed - results doesn't match")
 	}
+	return nil
 }
 
 
-func FindReadySeries(cfg *config) error {
+func findReadySeries(cfg *config) error {
 	if cfg.outputFname == "" {
-		return errors.New("No output file provided to resume")
+		return errors.New("no output file provided to resume")
 	}
 
 	if _, err := os.Stat(cfg.outputFname); os.IsNotExist(err) {
@@ -487,31 +494,70 @@ func FindReadySeries(cfg *config) error {
 }
 
 
-func DoMirror(cfg *config) {
-
-	conn := newConn(cfg)
-
-	series := listAllSeries(cfg, conn)
-
-	selectors := mapValues(series)
-	for idx, selector := range selectors {
-		if idx == cfg.maxSeriesToList+1 {
-			clog.Debug("...")
-			break
+func szToStr(size uint64) string {
+	fsize := float64(size)
+	prefixes := []string{"B", "KiB", "MiB", "GiB"}
+	for _, pref := range prefixes {
+		if fsize < 10 {
+			return fmt.Sprintf("%.2f%s", fsize, pref)
+		} else if fsize < 100 {
+			return fmt.Sprintf("%.1f%s", fsize, pref)
+		} else if fsize < 10240 {
+			return fmt.Sprintf("%d%s", int(fsize), pref)
 		}
-		clog.Debug("    ", selector)
+		fsize /= 1024
 	}
+	return strconv.Itoa(int(fsize)) + "TiB"
+}
 
-	if cfg.listOnly {
-		return
+
+func queryThread(selectorQ <-chan string, conn client.Client, results chan<- []byte, cfg *config,
+	             controlChan chan<- error) {
+	MainLoop: for {
+		select {
+		case selector := <-selectorQ:
+			if "" == selector {
+				clog.Info("Exit requested from queryThread exiting")
+				break MainLoop
+			}
+			clog.Debug("Selecting '", selector, "' serie")
+
+			startTm := time.Now().UnixNano()
+			data, err := mirrorSerie(cfg, selector2SQL(selector), conn)
+			if err != nil {
+				controlChan <- errors.New("Failed to select data: " + err.Error())
+				return
+			}
+			selectTimeMS := (time.Now().UnixNano() - startTm) / 1000000
+
+			if len(data.times) == 0 {
+				clog.Debug("Empty data")
+				continue
+			}
+
+			data.serie = selector
+			wbuff := packSerie(data)
+
+			if cfg.checkUnpack {
+				if err := testUnpack(data, bytes.NewBuffer(wbuff)) ; err != nil {
+					controlChan <- err
+					return
+				}
+			}
+
+			clog.Debug(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %s",
+				len(data.times), data.serie, selectTimeMS, szToStr(uint64(len(wbuff)))))
+			results <- wbuff
+		case <-time.After(0 * time.Microsecond):
+			clog.Info("No more selectors, exiting")
+			break MainLoop
+		}
 	}
+	controlChan <- nil
+}
 
-	clog.Info("Range would be splitted in to ", len(cfg.timePoints)-1, " subranges")
-	for idx := 0; idx < len(cfg.timePoints)-1; idx++ {
-		clog.Debug("    ", cfg.timePoints[idx], " - ", cfg.timePoints[idx+1])
-	}
 
-	var outFD *os.File
+func openOutputFile(cfg *config) (*os.File, error) {
 	if cfg.outputFname != "" {
 		var mode int
 		if cfg.resume && cfg.resumeOk {
@@ -521,16 +567,72 @@ func DoMirror(cfg *config) {
 		}
 		outF, err := os.OpenFile(cfg.outputFname, mode, 0666)
 		if err != nil {
-			clog.Fatal("Fail to open output file '", cfg.outputFname, "'. Error:", err.Error())
+			return nil, errors.New("fail to open output file '" + cfg.outputFname + "'. Error: " + err.Error())
 		}
-		defer outF.Close()
-		outFD = outF
 
 		if cfg.resume && cfg.resumeOk {
-			outFD.Seek(0, 2)
+			outF.Seek(0, 2)
 		}
+		return outF, nil
 	} else {
-		outFD = nil
+		return nil, nil
+	}
+}
+
+func DoMirror(cfg *config) error {
+	conn, err1 := newConn(cfg)
+	if err1 != nil {
+		return err1
+	}
+
+	series, err2 := listAllSeries(cfg, conn)
+	conn.Close()
+	if err2 != nil {
+		return err2
+	}
+
+
+	outFD, err3 := openOutputFile(cfg)
+	if err3 != nil {
+		return err3
+	}
+
+	if outFD != nil {
+		defer outFD.Close()
+	}
+
+	selectors := mapValues(series)
+
+	// filter out ready series
+	if cfg.resumeOk {
+		filteredSelectors := make([]string, 0, len(selectors) - len(cfg.readySeries))
+		for _, selector := range selectors {
+			if _, ok := cfg.readySeries[selector] ; !ok {
+				filteredSelectors = append(filteredSelectors, selector)
+			}
+		}
+		selectors = filteredSelectors
+	}
+
+	expectedSize := len(selectors) * (cfg.maxResultPoints*12 + 100)
+	clog.Info("Will totally select ", len(selectors),
+		" series. New data size would be less or close to ", szToStr(uint64(expectedSize)))
+
+	for idx, selector := range selectors {
+		if idx == cfg.maxSeriesToList+1 {
+			clog.Debug("...")
+			break
+		}
+		clog.Debug("    ", selector)
+	}
+
+	if cfg.listOnly {
+		return nil
+	}
+
+	clog.Info("Range would be splitted in to ", len(cfg.timePoints)-1, " subranges")
+	for idx := 0; idx < len(cfg.timePoints)-1; idx++ {
+		clog.Debug("    ", cfg.timePoints[idx], " - ", cfg.timePoints[idx+1])
 	}
 
 	sort.Strings(selectors)
@@ -539,63 +641,63 @@ func DoMirror(cfg *config) {
 	stime := time.Now()
 	totalSize := uint64(0)
 
-	if cfg.resumeOk {
-		filtered_selectors := make([]string, 0, len(selectors) - len(cfg.readySeries))
-		for _, selector := range selectors {
-			if _, ok := cfg.readySeries[selector] ; !ok {
-				filtered_selectors = append(filtered_selectors, selector)
+	tasksChan := make(chan string, len(selectors))
+	for _, selector := range selectors {
+		tasksChan <- selector
+	}
+
+	resultChan := make(chan []byte, cfg.thCount)
+	errChan := make(chan error, cfg.thCount)
+
+	conns := make([]client.Client, cfg.thCount)
+	for i := 0 ; i < cfg.thCount ; i++ {
+		if conn, err := newConn(cfg) ; err != nil {
+			return err
+		} else {
+			defer conn.Close()
+			conns[i] = conn
+		}
+	}
+
+	for _, thConn := range conns {
+		go queryThread(tasksChan, thConn, resultChan, cfg, errChan)
+	}
+
+	idx := 0
+	runningThreads := cfg.thCount
+	for runningThreads > 0 {
+		select {
+		case wbuff := <-resultChan:
+			idx += 1
+			cperc := idx * 100 / len(selectors)
+
+			if idx != len(selectors) && cperc > pperc {
+				usedS := time.Now().Sub(stime).Nanoseconds() / 1000000000
+				secondsLeft := float64(usedS) / float64(idx) * float64(len(selectors)-idx)
+				left := time.Duration(int(secondsLeft)) * time.Second
+				clog.Info(cperc, "% of all series selected. Approximatelly ", left,
+					" left. Total ", szToStr(totalSize), " MiB data written")
+				pperc = cperc
 			}
-		}
-		selectors = filtered_selectors
-	}
 
-	expectedSize := len(selectors) * (cfg.maxResultPoints*12 + 200)
-	clog.Info("Will totally select ", len(selectors),
-		" series. Results data size would be around ", expectedSize/1024, " KiB")
+			totalSize += uint64(len(wbuff))
 
-	startTm := time.Now().UnixNano()
-	for idx, selector := range selectors {
-
-		clog.Info("Selecting '", selector, "' serie")
-		err, data := mirrorSerie(cfg, selector2SQL(selector), conn)
-		if err != nil {
-			clog.Fatal("Failed to select data:", err.Error())
-		}
-
-		selectTimeMS := (time.Now().UnixNano() - startTm) / 1000000
-		if len(data.times) == 0 {
-			continue
-		}
-
-		data.serie = selector
-		wbuff := packSerie(data)
-
-		cperc := (idx + 1) * 100 / len(selectors)
-
-		if (idx + 1) != len(selectors) && cperc > pperc {
-			usedS := time.Now().Sub(stime).Nanoseconds() / 1000000000
-			secondsLeft := float64(usedS) / float64((idx + 1)) * float64(len(selectors)-(idx + 1))
-			left := time.Duration(int(secondsLeft)) * time.Second
-			clog.Info(cperc, "% of all series selected. Approximatelly ", left,
-				" left. Total ", totalSize/1024/1024, " MiB data written")
-			pperc = cperc
-		}
-		clog.Debug(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %d bytes",
-			len(data.times), data.serie, selectTimeMS, len(wbuff)))
-
-		totalSize += uint64(len(wbuff))
-		if cfg.checkUnpack {
-			testUnpack(data, bytes.NewBuffer(wbuff))
-		}
-
-		if outFD != nil {
-			outFD.Write(wbuff)
+			if outFD != nil {
+				outFD.Write(wbuff)
+			}
+		case err := <-errChan:
+			if err != nil {
+				clog.Error(err.Error())
+			}
+			runningThreads -= 1
 		}
 	}
-	clog.Info("Finished. Total ", totalSize/1024/1024, " MiB of data written")
+
+	clog.Info("Finished. Total ", szToStr(totalSize), " of data written")
+	return nil
 }
 
-func parseCLI(version string, cfg *config) {
+func parseCLI(version string, cfg *config) error {
 	app := kingpin.New(os.Args[0], "Influxdb data exporter")
 	app.Flag("url", "Server url").Short('U').PlaceHolder("PROTO://IP:PORT").
 		Default("http://localhost:8086").StringVar(&cfg.url)
@@ -605,37 +707,50 @@ func parseCLI(version string, cfg *config) {
 	app.Flag("db", "Database").Short('d').PlaceHolder("DATABASE").StringVar(&cfg.database)
 	app.Flag("output", "output file").Short('o').PlaceHolder("FILENAME").Default("").
 		StringVar(&cfg.outputFname)
-	app.Flag("loglevel", "Log level (default = DEBUG)").Short('l').Default("DEBUG").
+	app.Flag("log-level", "Log level (default = DEBUG)").Short('l').Default("DEBUG").
 		EnumVar(&cfg.logLevel, "DEBUG", "INFO", "WARNING", "ERROR", "FATAL")
 	app.Flag("check", "Check unpack of data").Short('c').BoolVar(&cfg.checkUnpack)
 	app.Flag("list-only", "Only list matched timeseries").Short('L').BoolVar(&cfg.listOnly)
 	app.Flag("max-list", "Max series to list").Short('m').Default("25").
 		IntVar(&cfg.maxSeriesToList)
 	app.Flag("resume", "Resume previously interrupted operation").Short('r').BoolVar(&cfg.resume)
+	app.Flag("threads", "Run in THCOUNT parrallel threads").PlaceHolder("THCOUNT").
+		Short('j').Default("1").IntVar(&cfg.thCount)
 	app.Arg("config", "Config file").Required().StringVar(&cfg.configName)
 	app.Version(version)
 	_, err := app.Parse(os.Args[1:])
 	if err != nil {
-		clog.Fatal("Fail to parse CLI: ", err.Error())
+		return errors.New("fail to parse CLI: " + err.Error())
 	}
-	clog.Info(cfg.configName)
+	return nil
 }
 
 func main() {
 	cfg := makeConfig()
-	parseCLI("0.0.1", cfg)
+	if err := parseCLI("0.0.1", cfg) ; err != nil {
+		clog.Error(err.Error())
+		os.Exit(1)
+	}
 
 	setupLogging(cfg.logLevel, os.Stdout)
-	parseCfg(cfg)
-	fillConfig(cfg)
 
-	clog.Info(cfg.seriesReq)
+	if err := parseCfg(cfg) ; err != nil {
+		clog.Error(err.Error())
+		os.Exit(1)
+	}
+	if err := fillConfig(cfg); err != nil {
+		clog.Error(err.Error())
+		os.Exit(1)
+	}
 
-	if (cfg.resume) {
-		err := FindReadySeries(cfg)
-		if err != nil {
-			clog.Fatal("Can't resume: " + err.Error())
+	if cfg.resume {
+		if err := findReadySeries(cfg) ; err != nil {
+			clog.Error("Can't resume: " + err.Error())
+			os.Exit(1)
 		}
 	}
-	DoMirror(cfg)
+	if err := DoMirror(cfg) ; err != nil {
+		clog.Error(err.Error())
+		os.Exit(1)
+	}
 }

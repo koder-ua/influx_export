@@ -53,7 +53,7 @@ class RAWStorage(INonIndexableStorage):
     def __exit__(self, type, value, traceback) -> bool:
         self.mfd.close()
         self.fd.close()
-        self.mdf = None
+        self.mfd = None
         self.fd = None
         return False
 
@@ -79,14 +79,13 @@ class RAWStorage(INonIndexableStorage):
             noffset = self.mfd.find(b'\x00', offset)
             name = self.mfd[offset: noffset].decode("ascii")
             sz, = struct.unpack(">I", self.mfd[noffset + 1: noffset + 5])
-            if sz > 1024:
-                metric, tags = self.split_serie_name(name)
-                if metric == 'diskio_write_bytes' and tags.get("host", "").startswith("ceph"):
-                    ts, data = self.unpack_data(noffset + 5, sz)
-                    data /= 1E9
-                else:
-                    data = ts = numpy.array([])
-                yield Serie(name, metric, tags, ts, data)
+            metric, tags = self.split_serie_name(name)
+            if metric == 'diskio_write_bytes' and tags.get("host", "").startswith("ceph"):
+                ts, data = self.unpack_data(noffset + 5, sz)
+                data /= 1E9
+            else:
+                data = ts = numpy.array([])
+            yield Serie(name, metric, tags, ts, data)
             offset = noffset + 5 + 12 * sz
 
 
