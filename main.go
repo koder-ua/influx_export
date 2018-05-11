@@ -18,8 +18,8 @@ import (
 
 	"github.com/influxdata/influxdb/client/v2"
 	"github.com/sirupsen/logrus"
-	"gopkg.in/alecthomas/kingpin.v2"
 	"github.com/tysonmote/gommap"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const IdentPattern = "[a-zA-Z_][a-zA-Z_0-9]+"
@@ -39,7 +39,6 @@ type config struct {
 	maxResultPoints int
 	outputFname     string
 	maxPerSecond    int
-	checkUnpack     bool
 	listOnly        bool
 	maxSeriesToList int
 	resume          bool
@@ -57,7 +56,7 @@ type SerieData struct {
 var clog = logrus.New()
 
 func makeConfig() *config {
-	return &config{params: make(map[string]string), checkUnpack: false}
+	return &config{params: make(map[string]string)}
 }
 
 func setupLogging(level string, output io.Writer) {
@@ -92,7 +91,7 @@ func parseCfg(cfg *config) error {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if len(line) > 0 && line[0] != '#' {
+		if len(line) > 0 && line[0] != '#' && line[0] != ';' {
 			if rr.MatchString(line) {
 				parts := strings.SplitN(line, "=", 2)
 				if _, alreadyHave := cfg.params[parts[0]]; alreadyHave {
@@ -397,7 +396,7 @@ func unpackSerie(buff *bytes.Buffer, unpackData bool) (*SerieData, error) {
 	}
 
 	data := SerieData{
-		serie:  selector[:len(selector)-1],
+		serie: selector[:len(selector)-1],
 	}
 
 	if unpackData {
@@ -427,7 +426,7 @@ func mapValues(mp *map[string]bool) []string {
 	return res
 }
 
-func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
+/*func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
 	if s1.serie != s2.serie || len(s1.values) != len(s2.values) {
 		return false
 	} else {
@@ -454,8 +453,7 @@ func testUnpack(origin *SerieData, rbuff *bytes.Buffer) error {
 		return errors.New("unpacking failed - results doesn't match")
 	}
 	return nil
-}
-
+}*/
 
 func findReadySeries(cfg *config) error {
 	if cfg.outputFname == "" {
@@ -493,7 +491,6 @@ func findReadySeries(cfg *config) error {
 	return nil
 }
 
-
 func szToStr(size uint64) string {
 	fsize := float64(size)
 	prefixes := []string{"B", "KiB", "MiB", "GiB"}
@@ -510,10 +507,10 @@ func szToStr(size uint64) string {
 	return strconv.Itoa(int(fsize)) + "TiB"
 }
 
-
 func queryThread(selectorQ <-chan string, conn client.Client, results chan<- []byte, cfg *config,
-	             controlChan chan<- error) {
-	MainLoop: for {
+	controlChan chan<- error) {
+MainLoop:
+	for {
 		select {
 		case selector := <-selectorQ:
 			if "" == selector {
@@ -537,14 +534,6 @@ func queryThread(selectorQ <-chan string, conn client.Client, results chan<- []b
 
 			data.serie = selector
 			wbuff := packSerie(data)
-
-			if cfg.checkUnpack {
-				if err := testUnpack(data, bytes.NewBuffer(wbuff)) ; err != nil {
-					controlChan <- err
-					return
-				}
-			}
-
 			clog.Debug(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %s",
 				len(data.times), data.serie, selectTimeMS, szToStr(uint64(len(wbuff)))))
 			results <- wbuff
@@ -556,14 +545,13 @@ func queryThread(selectorQ <-chan string, conn client.Client, results chan<- []b
 	controlChan <- nil
 }
 
-
 func openOutputFile(cfg *config) (*os.File, error) {
 	if cfg.outputFname != "" {
 		var mode int
 		if cfg.resume && cfg.resumeOk {
 			mode = os.O_WRONLY
 		} else {
-			mode = os.O_WRONLY|os.O_CREATE|os.O_TRUNC
+			mode = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 		}
 		outF, err := os.OpenFile(cfg.outputFname, mode, 0666)
 		if err != nil {
@@ -591,7 +579,6 @@ func DoMirror(cfg *config) error {
 		return err2
 	}
 
-
 	outFD, err3 := openOutputFile(cfg)
 	if err3 != nil {
 		return err3
@@ -605,9 +592,9 @@ func DoMirror(cfg *config) error {
 
 	// filter out ready series
 	if cfg.resumeOk {
-		filteredSelectors := make([]string, 0, len(selectors) - len(cfg.readySeries))
+		filteredSelectors := make([]string, 0, len(selectors)-len(cfg.readySeries))
 		for _, selector := range selectors {
-			if _, ok := cfg.readySeries[selector] ; !ok {
+			if _, ok := cfg.readySeries[selector]; !ok {
 				filteredSelectors = append(filteredSelectors, selector)
 			}
 		}
@@ -650,8 +637,8 @@ func DoMirror(cfg *config) error {
 	errChan := make(chan error, cfg.thCount)
 
 	conns := make([]client.Client, cfg.thCount)
-	for i := 0 ; i < cfg.thCount ; i++ {
-		if conn, err := newConn(cfg) ; err != nil {
+	for i := 0; i < cfg.thCount; i++ {
+		if conn, err := newConn(cfg); err != nil {
 			return err
 		} else {
 			defer conn.Close()
@@ -707,15 +694,14 @@ func parseCLI(version string, cfg *config) error {
 	app.Flag("db", "Database").Short('d').PlaceHolder("DATABASE").StringVar(&cfg.database)
 	app.Flag("output", "output file").Short('o').PlaceHolder("FILENAME").Default("").
 		StringVar(&cfg.outputFname)
-	app.Flag("log-level", "Log level (default = DEBUG)").Short('l').Default("DEBUG").
+	app.Flag("log-level", "Log level").Short('l').Default("DEBUG").
 		EnumVar(&cfg.logLevel, "DEBUG", "INFO", "WARNING", "ERROR", "FATAL")
-	app.Flag("check", "Check unpack of data").Short('c').BoolVar(&cfg.checkUnpack)
 	app.Flag("list-only", "Only list matched timeseries").Short('L').BoolVar(&cfg.listOnly)
 	app.Flag("max-list", "Max series to list").Short('m').Default("25").
 		IntVar(&cfg.maxSeriesToList)
 	app.Flag("resume", "Resume previously interrupted operation").Short('r').BoolVar(&cfg.resume)
-	app.Flag("threads", "Run in THCOUNT parrallel threads").PlaceHolder("THCOUNT").
-		Short('j').Default("1").IntVar(&cfg.thCount)
+	app.Flag("threads", "Run in THCOUNT parrallel threads. If not equal to 1 limits are applied separatelly to each thread").
+		PlaceHolder("THCOUNT").Short('j').Default("1").IntVar(&cfg.thCount)
 	app.Arg("config", "Config file").Required().StringVar(&cfg.configName)
 	app.Version(version)
 	_, err := app.Parse(os.Args[1:])
@@ -727,14 +713,14 @@ func parseCLI(version string, cfg *config) error {
 
 func main() {
 	cfg := makeConfig()
-	if err := parseCLI("0.0.1", cfg) ; err != nil {
+	if err := parseCLI("0.0.1", cfg); err != nil {
 		clog.Error(err.Error())
 		os.Exit(1)
 	}
 
 	setupLogging(cfg.logLevel, os.Stdout)
 
-	if err := parseCfg(cfg) ; err != nil {
+	if err := parseCfg(cfg); err != nil {
 		clog.Error(err.Error())
 		os.Exit(1)
 	}
@@ -744,12 +730,12 @@ func main() {
 	}
 
 	if cfg.resume {
-		if err := findReadySeries(cfg) ; err != nil {
+		if err := findReadySeries(cfg); err != nil {
 			clog.Error("Can't resume: " + err.Error())
 			os.Exit(1)
 		}
 	}
-	if err := DoMirror(cfg) ; err != nil {
+	if err := DoMirror(cfg); err != nil {
 		clog.Error(err.Error())
 		os.Exit(1)
 	}
