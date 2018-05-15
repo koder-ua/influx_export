@@ -2,7 +2,8 @@ import abc
 import mmap
 import struct
 import warnings
-from typing import Iterable, Tuple, Dict, Any
+import datetime
+from typing import Iterable, Tuple, Dict, Any, Callable
 from pathlib import Path
 
 import numpy
@@ -32,8 +33,18 @@ class INonIndexableStorage(metaclass=abc.ABCMeta):
     def __exit__(self, type, value, traceback) -> bool:
         pass
 
+    @abc.abstractmethod
+    def iter_meta_only(self) -> Iterable[Serie]:
+        pass
+
+    @abc.abstractmethod
+    def load_data(self, serie: Serie):
+        pass
+
 
 class RAWStorage(INonIndexableStorage):
+    jan_first_2017 = datetime.datetime(2017, 1, 1, 0, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+
     def __init__(self, path: Path, fd: Any, mfd: mmap.mmap) -> None:
         self.path = path
         self.fd = fd
@@ -69,10 +80,10 @@ class RAWStorage(INonIndexableStorage):
         offset += 8 * sz
         ts = numpy.array(
             struct.unpack(">" + "I" * sz, self.mfd[offset: offset + 4 * sz]),
-            dtype=numpy.uint32)
+            dtype=numpy.uint32) + self.jan_first_2017
         return ts, data
 
-    def __iter__(self) -> Iterable[Serie]:
+    def iter_meta_only(self) -> Iterable[Serie]:
         offset = 0
         while offset < len(self.mfd):
             # read name
@@ -80,13 +91,17 @@ class RAWStorage(INonIndexableStorage):
             name = self.mfd[offset: noffset].decode("ascii")
             sz, = struct.unpack(">I", self.mfd[noffset + 1: noffset + 5])
             metric, tags = self.split_serie_name(name)
-            if metric == 'diskio_write_bytes' and tags.get("host", "").startswith("ceph"):
-                ts, data = self.unpack_data(noffset + 5, sz)
-                data /= 1E9
-            else:
-                data = ts = numpy.array([])
-            yield Serie(name, metric, tags, ts, data)
+            yield Serie(name, metric, tags, offset=noffset + 5, size=sz)
             offset = noffset + 5 + 12 * sz
+
+    def load_data(self, serie: Serie):
+        serie.times, data = self.unpack_data(serie.offset, serie.size)
+        serie.vals = data / 1E9
+
+    def __iter__(self) -> Iterable[Serie]:
+        for serie in self.iter_meta_only():
+            self.load_data(serie)
+            yield serie
 
 
 class IStorage(INonIndexableStorage):

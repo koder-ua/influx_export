@@ -1,5 +1,5 @@
 from functools import wraps
-from typing import List, Tuple, Dict, Callable, Iterable
+from typing import List, Tuple, Dict, Callable, Iterable, Set
 
 import numpy
 
@@ -24,7 +24,9 @@ def ss_stage(func):
 
 
 @ss_stage
-def make_diff(arr: numpy.ndarray, perc: int = 99, min_good_window: int = 16) -> numpy.ndarray:
+def make_diff(arr: numpy.ndarray,
+              perc: int = 99,
+              min_good_window: int = 16) -> numpy.ndarray:
     diff = numpy.diff(arr)
     top99 = numpy.percentile(diff, perc)
 
@@ -35,7 +37,6 @@ def make_diff(arr: numpy.ndarray, perc: int = 99, min_good_window: int = 16) -> 
     in_noisy_part = False
     noisy_start_at = None
     clean_start_at = None
-
     for idx, dval in enumerate(diff):
         if top99 > dval > 0:
             # good point
@@ -78,13 +79,22 @@ def take(data: Iterable[numpy.ndarray], count: int) -> Iterable[numpy.ndarray]:
         yield arr
 
 
-def allign_times(ref_map: Dict[int, int], data: numpy.ndarray, times: numpy.ndarray) -> numpy.ndarray:
+def allign_times(ref_map: List[int],
+                 data: numpy.ndarray,
+                 times: Iterable[int]) -> numpy.ndarray:
     res = numpy.zeros(len(ref_map), dtype=data.dtype)
-    for tm, vl in zip(data, times):
-        try:
-            res[ref_map[tm]] = vl
-        except KeyError:
-            assert tm > max(ref_map) or tm < min(ref_map)
+    it1 = iter(enumerate(ref_map))
+    for vl, tm in zip(data, times):
+        idx, ref_tm = next(it1)
+        while ref_tm < tm:
+            res[idx] = 0
+            idx, ref_tm = next(it1)
+        assert ref_tm == tm, f"Extra time points in input data {ref_tm} {tm}"
+        res[idx] = vl
+
+    for idx, _ in it1:
+        res[idx] = 0
+
     return res
 
 

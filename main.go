@@ -133,15 +133,18 @@ func listAllSeries(cfg *config, conn client.Client) (*map[string]bool, error) {
 			}
 			return nil, errors.New("error listing time series: " + cerr.Error())
 		} else {
+			count := 0
 			for _, result := range response.Results {
 				for _, row := range result.Series {
 					for _, seriesList := range row.Values {
 						for _, serie := range seriesList {
 							series[serie.(string)] = true
+							count += 1
 						}
 					}
 				}
 			}
+			clog.Info("    found ", count, " series")
 		}
 	}
 	return &series, nil
@@ -455,6 +458,80 @@ func testUnpack(origin *SerieData, rbuff *bytes.Buffer) error {
 	return nil
 }*/
 
+
+func allignData(refTimes []uint32, data []uint64, times []uint32, res []uint64) error {
+	if len(res) != len(refTimes) {
+		return errors.New("result/refTimes size mismatch")
+	}
+
+	if len(data) != len(times) {
+		return errors.New("data/times size mismatch")
+	}
+
+	refMapIdx := 0
+	for dataIdx := 0 ; dataIdx < len(data) ; dataIdx++ {
+		for refTimes[refMapIdx] < times[dataIdx] {
+			res[refMapIdx] = 0
+			refMapIdx++
+		}
+		if refTimes[refMapIdx] != times[dataIdx] {
+			return errors.New("unexpected timestamp in times list")
+		}
+		res[refMapIdx] = data[dataIdx]
+	}
+	return nil
+}
+
+func addDiff(data []uint64, maxDiffVal uint64, minGoodWindowSz int, collector []uint64) error {
+	inNoisyPart := false
+	noisyStartAt := -1
+	cleanStartAt := -1
+	if len(collector) != len(data) - 1 {
+		return errors.New("Size of collector and data mismatch")
+	}
+
+	if minGoodWindowSz < 2 {
+		return errors.New("Wrong size of minGoodWindowSz")
+	}
+
+	for idx := 1; idx < len(data) ; idx++ {
+		diff := data[idx] - data[idx - 1]
+		if diff > 0 && diff < maxDiffVal {
+			if inNoisyPart {
+				if cleanStartAt == -1 {
+					cleanStartAt = idx
+				} else if idx - cleanStartAt == minGoodWindowSz {
+					// end of noisy part, fix it
+					noisyDelta := data[cleanStartAt] - data[noisyStartAt]
+					if noisyDelta > 0 {
+						for noisyStartAt != cleanStartAt {
+							cDiff := noisyDelta / uint64(cleanStartAt - noisyStartAt)
+							noisyDelta -= cDiff
+							collector[noisyStartAt - 1] += noisyDelta
+							noisyStartAt++
+						}
+					}
+
+					inNoisyPart = false
+					noisyStartAt = -1
+					cleanStartAt = -1
+				}
+			} else {
+				collector[idx - 1] += diff
+			}
+		} else {
+			if inNoisyPart {
+				cleanStartAt = -1
+			} else {
+				inNoisyPart = true
+				noisyStartAt = idx
+			}
+		}
+	}
+	return nil
+}
+
+
 func findReadySeries(cfg *config) error {
 	if cfg.outputFname == "" {
 		return errors.New("no output file provided to resume")
@@ -496,15 +573,15 @@ func szToStr(size uint64) string {
 	prefixes := []string{"B", "KiB", "MiB", "GiB"}
 	for _, pref := range prefixes {
 		if fsize < 10 {
-			return fmt.Sprintf("%.2f%s", fsize, pref)
+			return fmt.Sprintf("%.2f %s", fsize, pref)
 		} else if fsize < 100 {
-			return fmt.Sprintf("%.1f%s", fsize, pref)
+			return fmt.Sprintf("%.1f %s", fsize, pref)
 		} else if fsize < 10240 {
-			return fmt.Sprintf("%d%s", int(fsize), pref)
+			return fmt.Sprintf("%d %s", int(fsize), pref)
 		}
 		fsize /= 1024
 	}
-	return strconv.Itoa(int(fsize)) + "TiB"
+	return strconv.Itoa(int(fsize)) + " TiB"
 }
 
 func queryThread(selectorQ <-chan string, conn client.Client, results chan<- []byte, cfg *config,
@@ -514,7 +591,7 @@ MainLoop:
 		select {
 		case selector := <-selectorQ:
 			if "" == selector {
-				clog.Info("Exit requested from queryThread exiting")
+				clog.Info("No more selectors, exiting")
 				break MainLoop
 			}
 			clog.Debug("Selecting '", selector, "' serie")
@@ -528,7 +605,7 @@ MainLoop:
 			selectTimeMS := (time.Now().UnixNano() - startTm) / 1000000
 
 			if len(data.times) == 0 {
-				clog.Debug("Empty data")
+				results <- nil
 				continue
 			}
 
@@ -537,8 +614,8 @@ MainLoop:
 			clog.Debug(fmt.Sprintf("%d points selected for %s in %d ms. Packed into %s",
 				len(data.times), data.serie, selectTimeMS, szToStr(uint64(len(wbuff)))))
 			results <- wbuff
-		case <-time.After(0 * time.Microsecond):
-			clog.Info("No more selectors, exiting")
+		case <-time.After(1 * time.Second):
+			clog.Info("Channel read timeout, exiting")
 			break MainLoop
 		}
 	}
@@ -633,6 +710,8 @@ func DoMirror(cfg *config) error {
 		tasksChan <- selector
 	}
 
+	close(tasksChan)
+
 	resultChan := make(chan []byte, cfg.thCount)
 	errChan := make(chan error, cfg.thCount)
 
@@ -662,15 +741,21 @@ func DoMirror(cfg *config) error {
 				usedS := time.Now().Sub(stime).Nanoseconds() / 1000000000
 				secondsLeft := float64(usedS) / float64(idx) * float64(len(selectors)-idx)
 				left := time.Duration(int(secondsLeft)) * time.Second
-				clog.Info(cperc, "% of all series selected. Approximatelly ", left,
-					" left. Total ", szToStr(totalSize), " MiB data written")
+				msg := fmt.Sprintf("%d%% of all series selected. " +
+					"Total %s data written. Approx. %v left." +
+					" Total sz would be ~%s",
+					cperc, szToStr(totalSize), left,
+					szToStr(totalSize / uint64(idx) * uint64(len(selectors))))
+				clog.Info(msg)
 				pperc = cperc
 			}
 
-			totalSize += uint64(len(wbuff))
+			if wbuff != nil {
+				totalSize += uint64(len(wbuff))
 
-			if outFD != nil {
-				outFD.Write(wbuff)
+				if outFD != nil {
+					outFD.Write(wbuff)
+				}
 			}
 		case err := <-errChan:
 			if err != nil {
