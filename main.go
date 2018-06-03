@@ -108,18 +108,26 @@ func parseCfg(cfg *config) error {
 
 func listAllSeries(cfg *config, conn client.Client) (*map[string]bool, error) {
 	series := make(map[string]bool)
-
+    explicitSeries := 0
 	for lineno, query := range cfg.seriesReq {
+        if strings.HasPrefix(query, "+") {
+            query = strings.TrimSpace(query[1:len(query)])
+            series[query] = true
+            explicitSeries++
+            continue
+        }
+
 		parts := strings.SplitN(query, " ", 2)
 		if len(parts) == 0 {
 			return nil, errors.New(
-				"Error in config file at line " + strconv.Itoa(lineno) +
+				"Error in config file at serie #" + strconv.Itoa(lineno) +
 					" must be in format SERIE_NAME [FILTER_EXPR]")
 		}
 		if matched, _ := regexp.MatchString("[a-zA-Z_][a-zA-Z_0-9]*", parts[0]); !matched {
 			return nil, errors.New("error in config file at line " + strconv.Itoa(lineno) +
 				". Bad serie name, must be in format SERIE_NAME [FILTER_EXPR]")
 		}
+
 		sql := "SHOW SERIES FROM " + parts[0]
 		if len(parts) == 2 {
 			sql += " WHERE " + parts[1]
@@ -147,6 +155,7 @@ func listAllSeries(cfg *config, conn client.Client) (*map[string]bool, error) {
 			clog.Info("    found ", count, " series")
 		}
 	}
+    clog.Info("Total explicit series: ", explicitSeries)
 	return &series, nil
 }
 
@@ -428,36 +437,6 @@ func mapValues(mp *map[string]bool) []string {
 	}
 	return res
 }
-
-/*func checkSeriesEQ(s1 *SerieData, s2 *SerieData) bool {
-	if s1.serie != s2.serie || len(s1.values) != len(s2.values) {
-		return false
-	} else {
-		for idx := range s1.values {
-			if s1.values[idx] != s2.values[idx] || s1.times[idx] != s2.times[idx] {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func testUnpack(origin *SerieData, rbuff *bytes.Buffer) error {
-	v, e := unpackSerie(rbuff, true)
-	if e != nil {
-		return errors.New("failed to unpack " + e.Error())
-	}
-
-	if rbuff.Len() != 0 {
-		return errors.New("extra bytes left after unpacking")
-	}
-
-	if !checkSeriesEQ(v, origin) {
-		return errors.New("unpacking failed - results doesn't match")
-	}
-	return nil
-}*/
-
 
 func allignData(refTimes []uint32, data []uint64, times []uint32, res []uint64) error {
 	if len(res) != len(refTimes) {

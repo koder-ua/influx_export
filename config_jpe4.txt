@@ -5,6 +5,7 @@ maxperselect=5000
 maxpersecond=-1
 
 diskio_read_bytes host='ceph126' AND "name"='sdb' AND exported_host=''
++diskio_read_bytes host='ceph126' AND "name"='sdb' AND exported_host=''
 
 #libvirt_domain_block_stats_read_bytes_total AND target_device =~ /vd[a-z]+$/
 #libvirt_domain_block_stats_write_bytes_total AND target_device =~ /vd[a-z]+$/

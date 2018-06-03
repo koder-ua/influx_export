@@ -1,0 +1,14 @@
+* add lzma/tar+gzip compression/decompression func
+* collect cluster data first. Add .sh to collect data or .salt
+* build cluster model from collected data:
+    * devices info in form:
+        node_name -> dev_name -> dev_tags and vals, like
+
+        ceph001:
+            sdc: {__tags__: [osd_data], osd_id: 12, size: "5T"}
+* sync config set device types to be selected (how to match it with influx series tagging inconsistency?)
+* model + sync.cfg + influx_sync -> series_data.bin + config + model -> series_data.lzma (with embedded config and model)
+* series_data.lzma + reporter.py -> report + ....
+
+
+

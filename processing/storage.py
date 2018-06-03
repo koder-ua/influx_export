@@ -1,4 +1,4 @@
-import abc
+import os
 import mmap
 import struct
 import warnings
@@ -15,35 +15,14 @@ with warnings.catch_warnings():
 from .serie import Serie
 
 
-class INonIndexableStorage(metaclass=abc.ABCMeta):
-    @abc.abstractmethod
-    def __iter__(self) -> Iterable[Serie]:
-        pass
+class RAWStorage:
+    jan_first_2017 = int(datetime.datetime(2017, 1, 1, 0, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp())
 
-    @classmethod
-    @abc.abstractmethod
-    def open(cls, name: str, mode: str = 'r') -> 'INonIndexableStorage':
-        pass
-
-    @abc.abstractmethod
-    def __enter__(self) -> 'INonIndexableStorage':
-        pass
-
-    @abc.abstractmethod
-    def __exit__(self, type, value, traceback) -> bool:
-        pass
-
-    @abc.abstractmethod
-    def iter_meta_only(self) -> Iterable[Serie]:
-        pass
-
-    @abc.abstractmethod
-    def load_data(self, serie: Serie):
-        pass
-
-
-class RAWStorage(INonIndexableStorage):
-    jan_first_2017 = datetime.datetime(2017, 1, 1, 0, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    time_format = "Q"
+    time_sz = struct.calcsize(time_format)
+    data_format = "I"
+    data_sz = struct.calcsize(data_format)
+    rec_sz = time_sz + data_sz
 
     def __init__(self, path: Path, fd: Any, mfd: mmap.mmap) -> None:
         self.path = path
@@ -75,24 +54,33 @@ class RAWStorage(INonIndexableStorage):
 
     def unpack_data(self, offset: int, sz: int) -> Tuple[numpy.ndarray, numpy.ndarray]:
         data = numpy.array(
-            struct.unpack(">" + "Q" * sz, self.mfd[offset: offset + 8 * sz]),
+            struct.unpack(">" + self.time_format * sz, self.mfd[offset: offset + self.time_sz * sz]),
             dtype=numpy.float64)
-        offset += 8 * sz
+        offset += self.time_sz * sz
         ts = numpy.array(
-            struct.unpack(">" + "I" * sz, self.mfd[offset: offset + 4 * sz]),
-            dtype=numpy.uint32) + self.jan_first_2017
+            struct.unpack(">" + self.data_format * sz, self.mfd[offset: offset + self.data_sz * sz]),
+            dtype=numpy.uint32)
+        ts += self.jan_first_2017
         return ts, data
 
-    def iter_meta_only(self) -> Iterable[Serie]:
+    def _iter_recs_offsets(self, start_idx: int = 0) -> Iterable[Tuple[int, int, int]]:
         offset = 0
+        cnt = 0
         while offset < len(self.mfd):
-            # read name
-            noffset = self.mfd.find(b'\x00', offset)
-            name = self.mfd[offset: noffset].decode("ascii")
-            sz, = struct.unpack(">I", self.mfd[noffset + 1: noffset + 5])
+            name_end_offset = self.mfd.find(b'\x00', offset)
+            data_offset = name_end_offset + 5  # '\x00' + 4b size
+            sz, = struct.unpack(">I", self.mfd[data_offset - 4: data_offset])
+            if cnt >= start_idx:
+                # print(os.getpid(), offset, name_end_offset, data_offset, sz, self.mfd[offset: name_end_offset])
+                yield offset, name_end_offset, data_offset, sz
+            cnt += 1
+            offset = data_offset + self.rec_sz * sz
+
+    def iter_meta_only(self, start_idx: int = 0) -> Iterable[Serie]:
+        for name_offset, name_end_offset, data_offset, sz in self._iter_recs_offsets(start_idx):
+            name = self.mfd[name_offset: name_end_offset].decode("ascii")
             metric, tags = self.split_serie_name(name)
-            yield Serie(name, metric, tags, offset=noffset + 5, size=sz)
-            offset = noffset + 5 + 12 * sz
+            yield Serie(name, metric, tags, offset=data_offset, size=sz)
 
     def load_data(self, serie: Serie):
         serie.times, data = self.unpack_data(serie.offset, serie.size)
@@ -103,18 +91,14 @@ class RAWStorage(INonIndexableStorage):
             self.load_data(serie)
             yield serie
 
-
-class IStorage(INonIndexableStorage):
-    @abc.abstractmethod
-    def save(self, serie: Serie):
-        pass
-
-    @abc.abstractmethod
-    def get(self, name: str) -> Serie:
-        pass
+    def __len__(self) -> int:
+        idx = 0
+        for idx, _ in enumerate(self._iter_recs_offsets()):
+            pass
+        return idx
 
 
-class HDF5Storage(IStorage):
+class HDF5Storage:
     def __init__(self, path: Path, fd: h5py.File) -> None:
         self.path = path
         self.fd = fd
@@ -134,22 +118,59 @@ class HDF5Storage(IStorage):
         self.fd = None
 
     def save(self, serie: Serie):
-        dset = self.fd.create_dataset(serie.name, data=numpy.stack([serie.times, serie.vals]))
+        if '/' in serie.name:
+            directory, _ = serie.name.split('/')
+            if directory not in self.fd:
+                self.fd.create_group(directory)
+
+        if serie.times is not None:
+            data = numpy.stack([serie.times, serie.vals])
+        else:
+            data = serie.vals
+
+        dset = self.fd.create_dataset(serie.name, data=data)
+
         for k, v in serie.tags.items():
             assert k not in dset.attrs
             dset.attrs[k] = v
 
+    def remove(self, key: str):
+        if '/' in key:
+            grp_name, name = key.split("/")
+            grp = self.fd[grp_name]
+            del grp[name]
+        else:
+            del self.fd[key]
+
+    def __contains__(self, item: str) -> bool:
+        return item in self.fd
+
     def get(self, name: str) -> Serie:
         dset = self.fd[name]
-        assert len(dset.shape) == 2 and dset.shape[0] == 2
-        times = dset[0]
-        values = dset[1]
-        metric, tags = RAWStorage.split_serie_name(name)
-        return Serie(name, metric, tags, times, values)
+        data = dset.value
+        if len(data.shape) == 2:
+            assert data.shape[0] == 2
+            times = data[0]
+            values = data[1]
+        else:
+            times = None
+            values = data
+
+        metric, _ = RAWStorage.split_serie_name(name)
+        return Serie(name, metric, dict(dset.attrs.items()), times, values)
+
+    def __getitem__(self, name: str) -> Serie:
+        return self.get(name)
+
+    def __delitem__(self, name: str):
+        return self.remove(name)
+
+    def __iter__(self) -> Iterable[Serie]:
+        raise NotImplementedError()
 
 
-def make_storage(tp: str, file_name: str, mode: str = "r") -> INonIndexableStorage:
-    path = Path(file_name).expanduser()
+def make_storage(tp: str, file_name: str, mode: str = "r") -> Any:
+
     if tp == 'raw':
         return RAWStorage.open(path, mode)
     elif tp == 'hdf5':
