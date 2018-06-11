@@ -7,7 +7,6 @@ import json
 import pathlib
 import argparse
 import tempfile
-import contextlib
 import subprocess
 import collections
 from typing import List, Dict, Tuple, Any, Union, Set
@@ -233,7 +232,7 @@ def main(argv: List[str]):
     if data_path.is_file():
         with tempfile.TemporaryDirectory() as decompressed_path:
             with open(os.devnull, 'w') as devnull:
-                subprocess.check_call(["tar",  "-C", data_path, "-axvf",  decompressed_path], stdout=devnull)
+                subprocess.check_call(["tar",  "-C", decompressed_path, "-axvf", str(data_path)], stdout=devnull)
             ceph_info = CephClusterInfo(pathlib.Path(decompressed_path))
     else:
         ceph_info = CephClusterInfo(data_path)

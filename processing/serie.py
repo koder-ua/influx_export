@@ -16,3 +16,4 @@ class Serie:
 
     def __str__(self) -> str:
         return f"Serie(name='{self.name}', sz={len(self.vals)})"
+

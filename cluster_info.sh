@@ -1,5 +1,5 @@
 #!/bin/bash
-set -ex
+set -eux
 set -o pipefail
 
 function compress {
@@ -14,28 +14,52 @@ function compress {
     echo $OUTFILE
 }
 
-function usage {
-    echo "$0 HOSTS_FILE"
+function collect_ceph {
+    PSSH="$1"
+    OUTPUT_FOLDER="$2"
+    ceph osd tree -f json > "$OUTPUT_FOLDER/cephosdtree.js"
+    $PSSH -o "$OUTPUT_FOLDER/ceph_disk_list_js" sudo ceph-disk list --format json
+    $PSSH -o "$OUTPUT_FOLDER/lsblk" sudo lsblk -J
+    $PSSH -o "$OUTPUT_FOLDER/lsblk" sudo lsblk -O -J
+    $PSSH -o "$OUTPUT_FOLDER/ipa" sudo ip a
+    $PSSH -o "$OUTPUT_FOLDER/ls_ceph_dirs" sudo ls -l '/var/lib/ceph/osd/ceph-*'
+    $PSSH -o "$OUTPUT_FOLDER/ls_ceph_journals" sudo ls -l '/var/lib/ceph/osd/ceph-*/journal'
 }
 
-if [[ $# -ne 1 ]]; then
-    usage
-    exit 1
-fi
+function collect_compute {
+    PSSH="$PSSH_CMP"
+    $PSSH -o "$OUTPUT_FOLDER/ipa" sudo ip a
+}
 
-if ! [ -x "$(command -v parallel-ssh)" ]; then
-  echo 'Error: parallel-ssh is not installed.' >&2
-  exit 1
-fi
 
-PSSH=parallel-ssh -h "$1" -p 16 -O StrictHostKeyChecking=no -P
-OUTPUT_FOLDER=$(mktemp -t -d cluster_info.pssh.XXXXXXXX)
+function usage {
+    echo "$1 COMPUTES_HOSTS_FILE CEPTH_OSD_HOSTS_FILE"
+}
 
-$PSSH -o "$OUTPUT_FOLDER/ceph_disk_list_js" sudo ceph-disk list --format json
-$PSSH -o "$OUTPUT_FOLDER/lsblk" sudo lsblk --format json
-$PSSH -o "$OUTPUT_FOLDER/lsblk" sudo lsblk -O -J
-$PSSH -o "$OUTPUT_FOLDER/ipa" sudo ip a
-$PSSH -o "$OUTPUT_FOLDER/ls_ceph_dirs" sudo ls -l '/var/lib/ceph/osd/ceph-*'
-$PSSH -o "$OUTPUT_FOLDER/ls_ceph_journals" sudo ls -l '/var/lib/ceph/osd/ceph-*/journal'
 
-compress "$OUTPUT_FOLDER"
+function main {
+    NAME="$1"
+
+    if [[ $# -ne 3 ]]; then
+        usage "$NAME"
+        exit 1
+    fi
+
+    if ! [ -x "$(command -v parallel-ssh)" ]; then
+      echo 'Error: parallel-ssh is not installed.' >&2
+      exit 1
+    fi
+
+    PSSH_CMP=parallel-ssh -h "$1" -p 16 -O StrictHostKeyChecking=no -P
+    PSSH_CEPH=parallel-ssh -h "$2" -p 16 -O StrictHostKeyChecking=no -P
+    OUTPUT_FOLDER=$(mktemp -t -d cluster_info.pssh.XXXXXXXX)
+
+    collect_ceph "$PSSH_CEPH" "$OUTPUT_FOLDER"
+    collect_compute "$PSSH_CMP" "$OUTPUT_FOLDER"
+
+    compress "$OUTPUT_FOLDER"
+}
+
+main "$0" "$@"
+
+

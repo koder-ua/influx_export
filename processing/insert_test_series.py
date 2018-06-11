@@ -1,10 +1,11 @@
 import sys
+import random
 import datetime
 from typing import Iterable, Dict, List, Tuple
 
 from influxdb import InfluxDBClient
 
-from .storage import make_storage
+from .storage import RAWStorage
 
 
 def gen_data() -> Iterable[Tuple[str, Dict[str, str], List[Tuple[str, float]]]]:
@@ -41,11 +42,35 @@ def insert_test_data():
         client.write_points(points)
 
 
+def insert_many_series():
+    client = InfluxDBClient('localhost', 8086, 'scheduler', 'scheduler', 'scheduler')
+
+    ctime = datetime.datetime(2017, 2, 1, 0, 0, 10)
+    step = datetime.timedelta(seconds=10)
+
+    data = []
+    for didx in range(4):
+        data.append([f"{ctime:%Y-%m-%dT%H:%M:%SZ}", didx])
+        ctime += step
+
+    tm = []
+    for idx in range(20000):
+        tvl = str(random.randint(0, 100))
+        points = [
+            {"measurement": f"measurement",
+             "tags": {"tg": tvl, "idx": idx},
+             "time": tm,
+             "fields": {"value": val}}
+             for tm, val in data
+        ]
+        client.write_points(points)
+
+
 def test_downloaded_data():
     fpath = "/tmp/out.bin"
     all_data = []
 
-    with make_storage("raw", fpath) as src:
+    with RAWStorage.open(fpath, "r") as src:
         all_data.extend(src)
 
     expected = list(gen_data())
@@ -54,8 +79,7 @@ def test_downloaded_data():
     assert expected_series == have_series
 
 if sys.argv[1] == '-i':
-    insert_test_data()
+    # insert_test_data()
+    insert_many_series()
 else:
     test_downloaded_data()
-
-
