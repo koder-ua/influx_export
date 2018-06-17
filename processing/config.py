@@ -21,6 +21,7 @@ class LoadConfig:
     maxperselect: int
     maxpersecond: int
     selectors: List[Selector]
+    raw: str
 
 
 def to_datetime(val: str) -> datetime.datetime:
@@ -33,10 +34,11 @@ def to_timedelta(val: str) -> datetime.timedelta:
     return datetime.timedelta(seconds=int(val[:-1]) * coef)
 
 
-def parse_config(cfg: str) -> LoadConfig:
+def parse_config(cfg_path: str) -> LoadConfig:
     params: Dict[str, str] = {}
     selectors: List[Selector] = []
-    for line in Path(cfg).expanduser().open("r"):
+    raw = Path(cfg_path).expanduser().open("r").read()
+    for line in raw.split("\n"):
         line = line.strip()
         if not line or line.startswith(";") or line.startswith("#"):
             continue
@@ -56,4 +58,5 @@ def parse_config(cfg: str) -> LoadConfig:
                       step=to_timedelta(params['step']),
                       maxperselect=int(params.get("maxperselect", "0")),
                       maxpersecond=int(params.get("maxpersecond", "0")),
-                      selectors=selectors)
+                      selectors=selectors,
+                      raw=raw)

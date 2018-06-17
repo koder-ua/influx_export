@@ -1,4 +1,6 @@
-from typing import Callable, Dict, Tuple, Iterable, NamedTuple, List
+import abc
+from pathlib import Path
+from typing import Callable, Dict, Tuple, Iterable, NamedTuple, Any, Optional, Set
 
 import numpy
 import pandas
@@ -7,7 +9,8 @@ from matplotlib import pyplot
 from sklearn import linear_model
 
 from .serie import Serie
-from .storage import HDF5Storage
+from .interfaces import IDataStorage
+from .storage import open_storage
 
 sns.set_style("darkgrid")
 
@@ -27,7 +30,7 @@ def reduce_func(it: Iterable[Serie], key_func: KeyFunc, reduce_func: ReduceFunc)
     grouped_reduced: Dict[Tuple[str, ...], Tuple[int, numpy.ndarray]] = {}
 
     for serie in it:
-        key = key_func(serie.metric, serie.tags)
+        key = key_func(serie.metric, serie.attrs)
         try:
             cnt, curr  = grouped_reduced[key]
         except KeyError:
@@ -86,32 +89,253 @@ class Markers:
 
     @staticmethod
     def ceph_data_wr(root_name: str = "default") -> str:
-        return f"ceph/diskio_write_bytes::ceph_data::{root_name}"
+        return f"ceph_diskio_write_bytes::ceph_data::{root_name}"
 
     @staticmethod
     def ceph_j_wr(root_name: str = "default") -> str:
-        return f"ceph/diskio_write_bytes::ceph_journal::{root_name}"
+        return f"ceph_diskio_write_bytes::ceph_journal::{root_name}"
+
+    @staticmethod
+    def ceph_data_ioqd(root_name: str = "default") -> str:
+        return f"ceph_diskio_iops_in_progress::ceph_data::{root_name}"
 
     @staticmethod
     def ceph_disk_usage(root_name: str = "default") -> str:
-        return f"ceph/disk_usage::{root_name}"
+        return f"ceph_disk_usage::{root_name}"
 
-    vm_disk_write = "vm/disk_write"
+    ceph_cpu_usage = "ceph_cpu_usage"
+    vm_disk_write = "vm_disk_write"
 
 
 def sum_reduce(v1: numpy.ndarray, v2: numpy.ndarray) -> numpy.ndarray:
     return v1 + v2
 
 
-def get_ceph_disks_data_io(stor: HDF5Storage, crush_root: str = 'default') -> Serie:
-    target_serie = Markers.ceph_data_wr(crush_root)
-    if target_serie in stor:
-        return stor.get(target_serie)
+def sum_serie_func(serie: Serie, data: numpy.ndarray):
+    data += serie.vals
 
-    for idx, serie in enumerate(stor.select_series("raw", "diskio_write_bytes", dev_type='ceph_data', crush_root='default')):
+
+def avg_func(data: numpy.ndarray, count: int):
+    data /= count
+
+
+class Aggregator:
+    metric: str = None
+    def __init__(self, stor: IDataStorage, hdf5_fname: str, cluster: str, recalculate: bool, **params) -> None:
+        self.stor = stor
+        self.hdf5_fname = hdf5_fname
+        self.cluster = cluster
+        self.recalculate = recalculate
+
+        self.target_serie_name: Optional[str] = None
+        self.attrs: Dict[str, str] = None
+        self.selectors: Dict[str, str] = None
+        self.start_time: Optional[int] = None
+        self.stop_time: Optional[int] = None
+
+        self.post_init(**params)
+
+    def post_init(self, **params):
         pass
 
-    print("Total ceph io series count: ", idx)
+    def update_func(self, serie: Serie, data: Optional[numpy.ndarray]) -> Optional[numpy.ndarray]:
+        if data is None:
+            return serie.vals.copy()
+        data += serie.vals
+        return data
+
+    def final_func(self, res: numpy.ndarray, count: int) -> numpy.ndarray:
+        return res
+
+    def select(self) -> Iterable[Serie]:
+        return self.stor.select_series(self.cluster, self.metric, self.start_time, self.stop_time, **self.selectors)
+
+    def process_data(self) -> Serie:
+        if self.target_serie_name is not None:
+            if self.recalculate:
+                self.stor.remove(self.cluster, self.target_serie_name)
+            else:
+                try:
+                    return self.stor.get(self.cluster, self.target_serie_name)
+                except FileNotFoundError:
+                    pass
+
+        res: numpy.ndarray = None
+        times: numpy.ndarray = None
+        idx = 0
+        for idx, serie in enumerate(self.select):
+            if times is None:
+                times = serie.times
+            else:
+                assert (times == serie.times).all()
+            res = self.update_func(serie, res)
+
+        if res is None:
+            raise FileNotFoundError(f"No data found for cluster={self.cluster} " +
+                                    f"metric={self.metric} selectors={self.selectors}")
+
+        res = self.final_func(res, idx)
+
+        serie = Serie(name=self.target_serie_name,
+                      metric=self.target_serie_name,
+                      vals=res,
+                      times=times,
+                      attrs=self.attrs)
+
+        if self.target_serie_name is not None:
+            self.stor.get_saver(self.cluster, None, self.hdf5_fname)(serie)
+
+        return serie
+
+
+class CephAggregatorBase(Aggregator):
+    def post_init(self, crush_root: str):
+        self.attrs = {'dev_type': 'ceph_data',
+                      'crush_root': 'default',
+                      'host': '*',
+                      'device': 'ceph_data/default',
+                      'units': "B"}
+        self.selectors = {'dev_type': 'ceph_data', 'crush_root': crush_root}
+
+
+class CephDisksDataIo(CephAggregatorBase):
+    metric = "diskio_write_bytes"
+
+    def post_init(self, crush_root: str):
+        super().post_init(crush_root)
+        self.target_serie_name = Markers.ceph_data_wr(crush_root)
+
+
+class CephDisksUsageAverage(CephAggregatorBase):
+    metric = "disk_used_percent"
+
+    def post_init(self, crush_root: str):
+        super().post_init(crush_root)
+        self.target_serie_name = Markers.ceph_disk_usage(crush_root)
+
+    def final_func(self, res: numpy.ndarray, count: int) -> numpy.ndarray:
+        return res / count
+
+
+class CephDisksIOPSInProgress(CephAggregatorBase):
+    metric = "diskio_iops_in_progress"
+
+    def post_init(self, crush_root: str):
+        super().post_init(crush_root)
+        self.target_serie_name = Markers.ceph_data_ioqd(crush_root)
+
+
+class CephCPUUsageUser(Aggregator):
+    metric = "cpu_usage_user"
+
+    def post_init(self, node_name_prefix: str = 'ceph'):
+        self.attrs = {'host': '*', 'device': 'cpu', 'units': "S"}
+        self.selectors = {"cpu": "cpu-total"}
+        self.target_serie_name = Markers.ceph_cpu_usage
+        self.node_name_prefix = node_name_prefix
+
+    def update_func(self, serie: Serie, data: Optional[numpy.ndarray]) -> Optional[numpy.ndarray]:
+        if serie.host.startswith(self.node_name_prefix):
+            return super().update_func(serie, data)
+        return data
+
+
+class DiskBottleneck(Aggregator):
+    metric = "diskio_iops_in_progress"
+    def post_init(self):
+        self.attrs = {}
+        self.target_serie_name = None
+        self.selectors = {'dev_type': 'ceph_journal'}
+
+    def process_data(self) -> Serie:
+        qd_cnt: Dict[int, Dict[str, int]] = {}
+        qd_cnt_node: Dict[int, Dict[str, int]] = {}
+        node_disks: Dict[str, Set[str]] = {}
+        one_len: int = None
+        for serie in self.select():
+            if one_len is None:
+                one_len = len(serie.vals)
+
+            key = f"{serie.host}::{serie.device}"
+            for sz in (1, 4, 8, 16, 32, 64, 128, 256):
+                count = (serie.vals >= sz).sum()
+                if count > 0:
+                    qd_cnt.setdefault(sz, {})[key] = count
+                    qd_cnt_node.setdefault(sz, {})
+                    qd_cnt_node[sz][serie.host] = qd_cnt_node[sz].get(serie.host, 0) + count
+                node_disks.setdefault(serie.host, set()).add(serie.device)
+
+        for k, v in sorted(qd_cnt_node[16].items(), key=lambda x: x[1])[-20:][::-1]:
+            print(f"{k} => {v}, {int(v / len(node_disks[k]) / one_len * 100)}%")
+
+        return None
+
+
+class CPUBottleneck(Aggregator):
+    metric = "cpu_usage_user"
+    def post_init(self):
+        self.attrs = {}
+        self.target_serie_name = None
+        self.selectors = {"cpu": "cpu-total"}
+
+    def process_data(self) -> Serie:
+        cpu_usage: Dict[int, Dict[str, int]] = {}
+        one_len: int = None
+        for serie in self.select():
+            if serie.host == 'ceph085':
+                pyplot.hist(serie.vals, bins=20)
+                pyplot.show()
+                exit(0)
+            if one_len is None:
+                one_len = len(serie.vals)
+
+            for sz in (10, 20, 40, 80):
+                count = (serie.vals >= sz).sum()
+                if count > 0:
+                    cpu_usage.setdefault(sz, {})[serie.host] = count
+
+        for k, v in sorted(cpu_usage[20].items(), key=lambda x: x[1])[-20:][::-1]:
+            print(f"{k} => {v}, {int(v / one_len * 100)}%")
+
+        return None
+
+
+def process(cmd: str, opts: Any):
+    with open_storage(Path(opts.storage_path).expanduser()) as src:
+        params = src, opts.cluster + ".hdf5", opts.cluster, opts.force_update
+        if cmd == 'plot_ceph_io':
+            serie = CephDisksDataIo(*params, crush_root=opts.crush_root).process_data()
+        elif cmd == 'plot_ceph_usage':
+            serie = CephDisksUsageAverage(*params, crush_root=opts.crush_root).process_data()
+        elif cmd == 'plot_ceph_qd':
+            serie = CephDisksIOPSInProgress(*params, crush_root=opts.crush_root).process_data()
+        elif cmd == 'plot_ceph_cpu_user':
+            serie = CephCPUUsageUser(*params, node_name_prefix="ceph").process_data()
+        elif cmd == 'plot_ceph_cpu_per_mb':
+            CPUBottleneck(*params).process_data()
+            exit(0)
+            serie = CephDisksDataIo(*params, crush_root=opts.crush_root).process_data()
+            serie2 = CephCPUUsageUser(*params, node_name_prefix="ceph").process_data()
+
+            ps1 = serie.pandas
+            ps2 = serie2.pandas[1:]
+
+            s2 = ps2.rolling(100).sum() / ps1.rolling(100).sum()
+            s2.plot()
+            pyplot.show()
+            exit(0)
+
+            serie.vals = numpy.clip(serie2.vals[1:] * 1e6 / serie.vals, 0, 1e-2)
+
+            # f, axarr = pyplot.subplots(2, sharex=True)
+            # agg1.pandas.plot(ax=axarr[0])
+            # agg2.pandas.plot(ax=axarr[1])
+            # agg1.pandas.plot()
+            # agg2.pandas.plot(secondary_y=True)
+        else:
+            raise RuntimeError(f"Not supported subcommand {cmd}")
+    serie.pandas.plot()
+    pyplot.show()
 
 
 # def process_ceph_disks(taggify_func: Callable[[Serie], Tuple[bool, Dict[str, str]]],

@@ -6,8 +6,6 @@ from typing import Dict, Tuple, List, Iterator, Any, Set
 import yaml
 from dataclasses import dataclass, field
 
-from .serie import Serie
-
 
 DevTags = Dict[Tuple[str, str], Dict[str, str]]
 
@@ -26,18 +24,18 @@ class TagMatcher:
         self._matched = set()
         self._metric_rr = re.compile(self.metric_re)
 
-    def new_tags(self, serie: Serie) -> Dict[str, str]:
-        if serie.metric in self._not_matched:
+    def new_tags(self, metric: str, attrs: Dict[str, str]) -> Dict[str, str]:
+        if metric in self._not_matched:
             return {}
-        if serie.metric not in self._matched:
-            if self._metric_rr.match(serie.metric):
-                self._matched.add(serie.metric)
+        if metric not in self._matched:
+            if self._metric_rr.match(metric):
+                self._matched.add(metric)
             else:
-                self._not_matched.add(serie.metric)
+                self._not_matched.add(metric)
                 return {}
 
         try:
-            keys = map(serie.tags.__getitem__, self.target_fields)
+            keys = map(attrs.__getitem__, self.target_fields)
             return self.tags.get(tuple(keys), {})
         except KeyError:
             return {}

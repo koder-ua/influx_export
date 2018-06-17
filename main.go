@@ -106,118 +106,6 @@ func parseCfg(cfg *config) error {
 	return nil
 }
 
-const MAX_SERIES_PER_REQUEST = 10000
-const MAX_POINTS_PER_REQUEST = 10000
-
-
-func listAllSeries(cfg *config, conn client.Client) ([]string, error) {
-	series := make(map[string]bool)
-    explicitSeries := 0
-	for lineno, query := range cfg.seriesReq {
-        if strings.HasPrefix(query, "+") {
-            query = strings.TrimSpace(query[1:len(query)])
-            series[query] = true
-            explicitSeries++
-            continue
-        }
-
-        prefilterQuery := strings.HasPrefix(query, "=")
-        if prefilterQuery {
-            query = strings.TrimSpace(query[1:len(query)])
-        }
-
-		parts := strings.SplitN(query, " ", 2)
-		if len(parts) == 0 {
-			return nil, errors.New(
-				"Error in config file at serie #" + strconv.Itoa(lineno) +
-					" must be in format SERIE_NAME [FILTER_EXPR]")
-		}
-
-		if matched, _ := regexp.MatchString("[a-zA-Z_][a-zA-Z_0-9]*", parts[0]); !matched {
-			return nil, errors.New("error in config file at line " + strconv.Itoa(lineno) +
-				". Bad serie name, must be in format SERIE_NAME [FILTER_EXPR]")
-		}
-
-        var sql string
-
-        if prefilterQuery {
-            sql = "select time, last(value) FROM " + parts[0]
-    		sql	+= " WHERE time >= '" + cfg.timePoints[0]
-            sql	+= "' and time <= '" + cfg.timePoints[len(cfg.timePoints) - 1]
-            sql	+= "'"
-            if len(parts) == 2 {
-    			sql += " " + parts[1]
-    		}
-        } else {
-            sql = "SHOW SERIES FROM " + parts[0]
-    		if len(parts) == 2 {
-    			sql += " WHERE " + parts[1]
-    		}
-        }
-
-        offset := 0
-        hasMorePoints := true
-
-        for hasMorePoints {
-            csql := sql
-            if offset != 0 {
-                if prefilterQuery {
-                    csql += " SLIMIT " + strconv.Itoa(MAX_SERIES_PER_REQUEST) + " SOFFSET " +  strconv.Itoa(offset)
-                } else {
-                    csql += " LIMIT " + strconv.Itoa(MAX_POINTS_PER_REQUEST) + " OFFSET " +  strconv.Itoa(offset)
-                }
-            }
-            clog.Info(csql)
-            q := client.NewQuery(csql, cfg.database, "ns")
-        	if response, err := conn.Query(q); err != nil || response.Error() != nil {
-        		cerr := err
-        		if cerr == nil {
-        			cerr = response.Error()
-        		}
-        		return nil, errors.New("error listing time series: " + cerr.Error())
-        	} else {
-        		for _, result := range response.Results {
-                    if prefilterQuery {
-                        hasMorePoints = (len(result.Series) == MAX_SERIES_PER_REQUEST)
-                        offset += len(result.Series)
-                    }
-        			for _, row := range result.Series {
-                        if prefilterQuery {
-                            serieLst := make([]string, 0, 1 + len(row.Tags))
-                            serieLst = append(serieLst, row.Name)
-                            for name, val := range row.Tags {
-                                serieLst = append(serieLst, name + "=" + val)
-                            }
-                            sort.Strings(serieLst[1:])
-                            series[strings.Join(serieLst, ",")] = true
-                        } else {
-        					for _, seriesList := range row.Values {
-                                hasMorePoints = (len(seriesList) == MAX_POINTS_PER_REQUEST)
-        						for _, serie := range seriesList {
-                                    serieLst := strings.Split(serie.(string), ",")
-                                    sort.Strings(serieLst[1:])
-                                    series[strings.Join(serieLst, ",")] = true
-        						}
-                                offset += len(seriesList)
-        					}
-                        }
-        			}
-        		}
-        	}
-        }
-        clog.Info("    found ", offset, " series")
-	}
-
-    clog.Info("Total explicit series: ", explicitSeries)
-
-    templates := make([]string, 0, len(series))
-    for templ, _ :=  range series {
-        templates = append(templates, templ)
-    }
-
-	return templates, nil
-}
-
 
 func listAllSeriesSimple(cfg *config, conn client.Client) ([]string, error) {
 	series := make(map[string]bool)
@@ -234,7 +122,7 @@ func listAllSeriesSimple(cfg *config, conn client.Client) ([]string, error) {
 				". Bad serie name, must be in format SERIE_NAME [FILTER_EXPR]")
 		}
 
-        sql := "SHOW SERIES FROM " + parts[0]
+        sql := "SHOW SERIES FROM \"" + parts[0] + "\""
     	if len(parts) == 2 {
     		sql += " WHERE " + parts[1]
     	}
@@ -472,7 +360,7 @@ func newConn(cfg *config) (client.Client, error) {
 
 func selector2SQL(selector string) string {
 	parts := strings.Split(selector, ",")
-	res := parts[0] + " WHERE "
+	res := "\"" + parts[0] + "\" WHERE "
 	for idx, expr := range parts[1:] {
 		nameAndVal := strings.SplitN(expr, "=", 2)
 		if len(nameAndVal) != 2 {

@@ -185,7 +185,7 @@ class CephInfluxProcessorConfigGenerator:
             dev_name = pathlib.Path(dev).name
             host_mp[f"name={dev_name}"] = {"dev_type": f"ceph_{tp.name}", "crush_root": root}
 
-        print(yaml.dump({"diskio_(write|read)_bytes": mp}, indent=4))
+        print(yaml.dump({"(diskio_write_bytes|diskio_read_bytes|diskio_iops_in_progress)": mp}, indent=4))
 
     def generate_ceph_partitions(self):
         dev_types: Dict[Tuple[str, str], Tuple[str, DiskTypes]] = {}
