@@ -24,6 +24,10 @@ def load_config_file(opts: Any):
         opts.__dict__.update(config)
 
 
+ceph_cmd_subparsers = ['plot_ceph_io', 'plot_ceph_qd', 'plot_ceph_usage', 'plot_ceph_cpu_user', 'plot_ceph_cpu_per_mb']
+bneck_subparsers = ['cpu_bottleneck', 'disk_qd_bottleneck', 'network_bottleneck']
+
+
 def parse_args(args: List[str]) -> Any:
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default="~/.mira-ml/config.yaml")
@@ -44,19 +48,15 @@ def parse_args(args: List[str]) -> Any:
     import_parser.add_argument('-s', '--sync-config', metavar="SYNC_CONFIG_FILE", required=True)
     import_parser.add_argument('raw_src', metavar='RAW_SRC', help="File to import")
 
-    # ceph analyses parsers
-    plot_ceph_io = subparsers.add_parser('plot_ceph_io',
-                                         help='Calculate and plot total io on ceph data disks')
-    plot_ceph_qd = subparsers.add_parser('plot_ceph_qd',
-                                         help='Calculate and plot total storage disks QD on ceph data disks')
-    plot_ceph_usage = subparsers.add_parser('plot_ceph_usage')
-    plot_ceph_cpu_user = subparsers.add_parser('plot_ceph_cpu_user')
-    plot_ceph_cpu_per_mb = subparsers.add_parser('plot_ceph_cpu_per_mb')
-
-    for cparser in [plot_ceph_io, plot_ceph_qd, plot_ceph_usage, plot_ceph_cpu_user, plot_ceph_cpu_per_mb]:
-        cparser.add_argument("-r", '--crush-root', default='default', help="Crush root to analyze")
+    for name in ceph_cmd_subparsers:
+        cparser = subparsers.add_parser(name)
+        cparser.add_argument('-r', '--crush-root', default='default', help="Crush root to analyze")
         cparser.add_argument('-c', '--cluster', required=True, help="Cluster cluster name")
         cparser.add_argument('-f', '--force-update', action='store_true', help="Recalculate metric")
+
+    for name in bneck_subparsers:
+        cparser = subparsers.add_parser(name)
+        cparser.add_argument('-c', '--cluster', required=True, help="Cluster cluster name")
 
     return parser.parse_args(args[1:])
 
@@ -76,8 +76,7 @@ def main(argv: List[str]) -> int:
             symulate_import(opts, cfg)
         else:
             do_import(opts, cfg)
-    elif opts.subparser_name in ('plot_ceph_io', 'plot_ceph_usage', 'plot_ceph_qd',
-            'plot_ceph_cpu_user', 'plot_ceph_cpu_per_mb'):
+    elif opts.subparser_name in (ceph_cmd_subparsers + bneck_subparsers):
         process(opts.subparser_name, opts)
     else:
         print(f"Action {opts.subparser_name} is not supported")

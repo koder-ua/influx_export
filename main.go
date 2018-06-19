@@ -129,6 +129,7 @@ func listAllSeriesSimple(cfg *config, conn client.Client) ([]string, error) {
 
         clog.Info(sql)
         q := client.NewQuery(sql, cfg.database, "ns")
+        q.Chunked = true
         totalFound := 0
     	if response, err := conn.Query(q); err != nil || response.Error() != nil {
     		cerr := err

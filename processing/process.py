@@ -1,4 +1,5 @@
 import abc
+import collections
 from pathlib import Path
 from typing import Callable, Dict, Tuple, Iterable, NamedTuple, Any, Optional, Set
 
@@ -163,7 +164,7 @@ class Aggregator:
         res: numpy.ndarray = None
         times: numpy.ndarray = None
         idx = 0
-        for idx, serie in enumerate(self.select):
+        for idx, serie in enumerate(self.select()):
             if times is None:
                 times = serie.times
             else:
@@ -248,9 +249,9 @@ class DiskBottleneck(Aggregator):
         self.selectors = {'dev_type': 'ceph_journal'}
 
     def process_data(self) -> Serie:
-        qd_cnt: Dict[int, Dict[str, int]] = {}
-        qd_cnt_node: Dict[int, Dict[str, int]] = {}
-        node_disks: Dict[str, Set[str]] = {}
+        qd_cnt: Dict[int, Dict[str, int]] = collections.defaultdict(dict)
+        qd_cnt_node: Dict[int, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+        node_disks: Dict[str, Set[str]] = collections.defaultdict(set)
         one_len: int = None
         for serie in self.select():
             if one_len is None:
@@ -260,10 +261,9 @@ class DiskBottleneck(Aggregator):
             for sz in (1, 4, 8, 16, 32, 64, 128, 256):
                 count = (serie.vals >= sz).sum()
                 if count > 0:
-                    qd_cnt.setdefault(sz, {})[key] = count
-                    qd_cnt_node.setdefault(sz, {})
-                    qd_cnt_node[sz][serie.host] = qd_cnt_node[sz].get(serie.host, 0) + count
-                node_disks.setdefault(serie.host, set()).add(serie.device)
+                    qd_cnt[sz][key] = count
+                    qd_cnt_node[sz][serie.host] += count
+                node_disks[serie.host].add(serie.device)
 
         for k, v in sorted(qd_cnt_node[16].items(), key=lambda x: x[1])[-20:][::-1]:
             print(f"{k} => {v}, {int(v / len(node_disks[k]) / one_len * 100)}%")
@@ -279,7 +279,7 @@ class CPUBottleneck(Aggregator):
         self.selectors = {"cpu": "cpu-total"}
 
     def process_data(self) -> Serie:
-        cpu_usage: Dict[int, Dict[str, int]] = {}
+        cpu_usage: Dict[int, Dict[str, int]] = collections.defaultdict(dict)
         one_len: int = None
         for serie in self.select():
             if serie.host == 'ceph085':
@@ -292,7 +292,7 @@ class CPUBottleneck(Aggregator):
             for sz in (10, 20, 40, 80):
                 count = (serie.vals >= sz).sum()
                 if count > 0:
-                    cpu_usage.setdefault(sz, {})[serie.host] = count
+                    cpu_usage[sz][serie.host] = count
 
         for k, v in sorted(cpu_usage[20].items(), key=lambda x: x[1])[-20:][::-1]:
             print(f"{k} => {v}, {int(v / one_len * 100)}%")
@@ -300,42 +300,74 @@ class CPUBottleneck(Aggregator):
         return None
 
 
+def net_bottleneck(src: IDataStorage, cluster: str, start_time: int = None, stop_time: int = None):
+    metric = "net_bytes_sent"
+    net_usage: Dict[int, Dict[str, int]] = collections.defaultdict(dict)
+    one_len: int = None
+    dtime = None
+    for serie in src.select_series(cluster, metric, start_time, stop_time):
+        if one_len is None:
+            one_len = len(serie.vals)
+            dtime = serie.times[1] - serie.times[0]
+
+        # print(serie.device, numpy.percentile(serie.vals, [90]))
+
+        for mbps in (10, 100, 800):
+            count = (serie.vals >= mbps * dtime * (2 ** 20)).sum()
+            if count > 0:
+                net_usage[mbps][f"{serie.host}::{serie.device}"] = count
+
+    for k, v in sorted(net_usage[100].items(), key=lambda x: x[1])[-20:][::-1]:
+        print(f"{k} => {v}, {int(v / one_len * 100)}%")
+
+    return None
+
+
 def process(cmd: str, opts: Any):
     with open_storage(Path(opts.storage_path).expanduser()) as src:
-        params = src, opts.cluster + ".hdf5", opts.cluster, opts.force_update
-        if cmd == 'plot_ceph_io':
-            serie = CephDisksDataIo(*params, crush_root=opts.crush_root).process_data()
-        elif cmd == 'plot_ceph_usage':
-            serie = CephDisksUsageAverage(*params, crush_root=opts.crush_root).process_data()
-        elif cmd == 'plot_ceph_qd':
-            serie = CephDisksIOPSInProgress(*params, crush_root=opts.crush_root).process_data()
-        elif cmd == 'plot_ceph_cpu_user':
-            serie = CephCPUUsageUser(*params, node_name_prefix="ceph").process_data()
-        elif cmd == 'plot_ceph_cpu_per_mb':
-            CPUBottleneck(*params).process_data()
-            exit(0)
-            serie = CephDisksDataIo(*params, crush_root=opts.crush_root).process_data()
-            serie2 = CephCPUUsageUser(*params, node_name_prefix="ceph").process_data()
+        if cmd in ('plot_ceph_io', 'plot_ceph_usage', 'plot_ceph_qd', 'plot_ceph_cpu_user'):
+            params = src, opts.cluster + ".hdf5", opts.cluster, opts.force_update
+            if cmd == 'plot_ceph_io':
+                serie = CephDisksDataIo(*params, crush_root=opts.crush_root).process_data()
+            elif cmd == 'plot_ceph_usage':
+                serie = CephDisksUsageAverage(*params, crush_root=opts.crush_root).process_data()
+            elif cmd == 'plot_ceph_qd':
+                serie = CephDisksIOPSInProgress(*params, crush_root=opts.crush_root).process_data()
+            elif cmd == 'plot_ceph_cpu_user':
+                serie = CephCPUUsageUser(*params, node_name_prefix="ceph").process_data()
+            else:
+                raise ValueError(f"Unknown option {cmd}")
 
-            ps1 = serie.pandas
-            ps2 = serie2.pandas[1:]
-
-            s2 = ps2.rolling(100).sum() / ps1.rolling(100).sum()
-            s2.plot()
+            serie.pandas.plot()
             pyplot.show()
-            exit(0)
-
-            serie.vals = numpy.clip(serie2.vals[1:] * 1e6 / serie.vals, 0, 1e-2)
-
-            # f, axarr = pyplot.subplots(2, sharex=True)
-            # agg1.pandas.plot(ax=axarr[0])
-            # agg2.pandas.plot(ax=axarr[1])
-            # agg1.pandas.plot()
-            # agg2.pandas.plot(secondary_y=True)
         else:
-            raise RuntimeError(f"Not supported subcommand {cmd}")
-    serie.pandas.plot()
-    pyplot.show()
+            params = src, opts.cluster + ".hdf5", opts.cluster
+
+            if cmd == 'plot_ceph_cpu_per_mb':
+                params += (opts.force_update,)
+                serie = CephDisksDataIo(*params, crush_root=opts.crush_root).process_data()
+                serie2 = CephCPUUsageUser(*params, node_name_prefix="ceph").process_data()
+
+                ps1 = serie.pandas
+                ps2 = serie2.pandas[1:]
+
+                s2 = ps2.rolling(100).sum() / ps1.rolling(100).sum()
+                s2.plot()
+                pyplot.show()
+            elif cmd == 'cpu_bottleneck':
+                CPUBottleneck(*params).process_data()
+            elif cmd == 'disk_qd_bottleneck':
+                DiskBottleneck(*params).process_data()
+            elif cmd == 'network_bottleneck':
+                net_bottleneck(src, opts.cluster)
+            else:
+                # serie.vals = numpy.clip(serie2.vals[1:] * 1e6 / serie.vals, 0, 1e-2)
+                # f, axarr = pyplot.subplots(2, sharex=True)
+                # agg1.pandas.plot(ax=axarr[0])
+                # agg2.pandas.plot(ax=axarr[1])
+                # agg1.pandas.plot()
+                # agg2.pandas.plot(secondary_y=True)
+                raise RuntimeError(f"Not supported subcommand {cmd}")
 
 
 # def process_ceph_disks(taggify_func: Callable[[Serie], Tuple[bool, Dict[str, str]]],

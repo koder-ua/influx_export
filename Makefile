@@ -1,7 +1,7 @@
 .PHONY: clean rebuild
 
 influx_sync: main.go
-		go build
+		CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-extldflags "-static"' .
 
 clean:
 		-rm -rf influx_sync
